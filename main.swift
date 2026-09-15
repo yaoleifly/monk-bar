@@ -323,6 +323,16 @@ func state(_ o: Order) -> (label: String, bad: Bool) {
     return ("可调用", false)
 }
 
+/// 检查订阅有效期是否不足 3 天（或已到期 / 即将到期）
+func isExpiringSoon(_ o: Order) -> Bool {
+    if o.expired == true || o.keyActive == false { return true }
+    if let ms = o.remainingMs, ms > 0 {
+        let days = ms / 1000.0 / 86400.0
+        return days <= 3.0 || o.soon == true
+    }
+    return o.soon == true
+}
+
 func summaryLine(_ o: Order) -> String {
     let st = state(o)
     return [
@@ -466,9 +476,10 @@ final class Agent: NSObject, NSMenuDelegate {
     func render() {
         if let o = order {
             let st = state(o)
+            let expiring = isExpiringSoon(o)
             setAttributedTitle(
-                makeStatusAttributedTitle(cost: o.dailyCost, limit: o.dailyLimit, remainingMs: o.remainingMs, isBad: st.bad, mode: displayMode),
-                tip: summaryLine(o)
+                makeStatusAttributedTitle(cost: o.dailyCost, limit: o.dailyLimit, remainingMs: o.remainingMs, isBad: st.bad || expiring, mode: displayMode),
+                tip: summaryLine(o) + (expiring ? " | ⚠️ 有效期不足 3 天，建议续费" : "")
             )
         } else if Cfg.load() == nil {
             setAttributedTitle(
@@ -493,6 +504,17 @@ final class Agent: NSObject, NSMenuDelegate {
 
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
+
+        // 当有效期不足 3 天或已到期时，置顶醒目引导续费新套餐
+        if let o = order, isExpiringSoon(o) {
+            let daysLeft = Fmt.left(o.remainingMs, expired: o.expired == true)
+            let title = o.expired == true ? "⚠️ 订阅已到期 · 立即续订新套餐 ↗" : "🔥 订阅即将到期 (剩余 \(daysLeft)) · 立即续订 ↗"
+            let renewItem = NSMenuItem(title: title, action: #selector(doOpenPricing), keyEquivalent: "")
+            renewItem.target = self
+            menu.addItem(renewItem)
+            menu.addItem(.separator())
+        }
+
         if let o = order { addOrderItems(to: menu, o) }
         if let note { menu.addItem(info("⚠︎ " + note, multiline: true)) }
         menu.addItem(.separator())
@@ -537,6 +559,12 @@ final class Agent: NSObject, NSMenuDelegate {
         acct.keyEquivalentModifierMask = [.command, .shift]
         acct.target = self
         menu.addItem(acct)
+
+        // 推荐搭配的 Monk-Pi Coding Agent 工具
+        let monkPiItem = NSMenuItem(title: "⚡️ 推荐 Agent 工具：Monk-Pi 终端助手 ↗", action: #selector(doOpenMonkPi), keyEquivalent: "")
+        monkPiItem.target = self
+        menu.addItem(monkPiItem)
+
         let conf = NSMenuItem(title: "设置账号…", action: #selector(doSettings), keyEquivalent: ",")
         conf.target = self
         menu.addItem(conf)
@@ -595,6 +623,14 @@ final class Agent: NSObject, NSMenuDelegate {
     }
 
     @objc func doRefresh() { refreshIfNeeded() }
+
+    @objc func doOpenPricing() {
+        NSWorkspace.shared.open(URL(string: "https://monk.party/")!)
+    }
+
+    @objc func doOpenMonkPi() {
+        NSWorkspace.shared.open(URL(string: "https://github.com/yaoleifly/monk-pi")!)
+    }
 
     @objc func selectModeDetailed() { setDisplayMode(.detailed) }
     @objc func selectModeCompact() { setDisplayMode(.compact) }
@@ -690,6 +726,37 @@ final class SettingsViewModel: ObservableObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
             withAnimation(.easeInOut(duration: 0.2)) { self?.copiedBaseURL = false }
         }
+    }
+
+    @Published var copiedMonkPiNpx: Bool = false
+    @Published var copiedMonkPiBrew: Bool = false
+
+    func copyMonkPiNpx() {
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.setString("npx monk-pi", forType: .string)
+        withAnimation(.easeInOut(duration: 0.2)) { copiedMonkPiNpx = true }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+            withAnimation(.easeInOut(duration: 0.2)) { self?.copiedMonkPiNpx = false }
+        }
+    }
+
+    func copyMonkPiBrew() {
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.setString("brew install yaoleifly/tap/monk-pi", forType: .string)
+        withAnimation(.easeInOut(duration: 0.2)) { copiedMonkPiBrew = true }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+            withAnimation(.easeInOut(duration: 0.2)) { self?.copiedMonkPiBrew = false }
+        }
+    }
+
+    func openMonkPiGitHub() {
+        NSWorkspace.shared.open(URL(string: "https://github.com/yaoleifly/monk-pi")!)
+    }
+
+    func openPricing() {
+        NSWorkspace.shared.open(URL(string: "https://monk.party/")!)
     }
 
     func refreshNow() {
@@ -910,12 +977,19 @@ struct SettingsView: View {
             ScrollView(.vertical, showsIndicators: true) {
                 VStack(spacing: 16) {
                     if let o = model.agent?.order {
+                        // 有效期不足 3 天或已过期时，置顶显示醒目续费卡片
+                        if isExpiringSoon(o) {
+                            renewalBanner(o)
+                        }
                         // 订单已加载：展示全套 Bento Grid 仪表盘
                         liveDashboard(o)
                     } else {
                         // 未加载或未配置：引导卡片
                         unconfiguredCard
                     }
+
+                    // 推荐搭配的 Monk-Pi Coding Agent 工具卡片
+                    monkPiRecommendationCard
 
                     // 凭据配置卡片
                     credentialsCard
@@ -1247,6 +1321,134 @@ struct SettingsView: View {
         .padding(.vertical, 2.5)
         .background(Color.primary.opacity(0.04))
         .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+    }
+
+    // MARK: - 到期续费引导横幅
+    @ViewBuilder
+    private func renewalBanner(_ o: Order) -> some View {
+        let daysLeft = Fmt.left(o.remainingMs, expired: o.expired == true)
+        HStack(spacing: 14) {
+            Image(systemName: "flame.fill")
+                .font(.system(size: 22))
+                .foregroundStyle(Visuals.flameOrange)
+                .frame(width: 40, height: 40)
+                .background(Visuals.flameOrange.opacity(0.12))
+                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 6) {
+                    Text(o.expired == true ? "Monk 套餐已到期" : "Monk 套餐即将到期")
+                        .font(.system(size: 13, weight: .bold))
+                        .foregroundStyle(Visuals.flameOrange)
+
+                    Text("剩余 \(daysLeft)")
+                        .font(.system(size: 10, weight: .semibold))
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(Visuals.flameOrange.opacity(0.15))
+                        .foregroundStyle(Visuals.flameOrange)
+                        .clipShape(Capsule())
+                }
+
+                Text(o.expired == true
+                    ? "您的月卡权限已到期，无法继续调用。请续订新套餐以立即恢复模型调用服务。"
+                    : "当前套餐有效期不足 3 天（到期时间 \(Fmt.date(o.expiresAt))）。为保证日常开发与 Coding Agent 服务不中断，建议提前续费。")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+
+            Spacer()
+
+            Button {
+                model.openPricing()
+            } label: {
+                HStack(spacing: 4) {
+                    Text("立即续订新套餐")
+                    Image(systemName: "arrow.up.forward.app")
+                }
+                .font(.caption.weight(.semibold))
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(Visuals.flameOrange)
+        }
+        .padding(12)
+        .background(Visuals.flameOrange.opacity(0.06))
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 12, style: .continuous)
+                .stroke(Visuals.flameOrange.opacity(0.35), lineWidth: 1)
+        )
+    }
+
+    // MARK: - 推荐搭配 Monk-Pi 工具卡片
+    private var monkPiRecommendationCard: some View {
+        MetricCard(title: "推荐搭配 · Monk × Pi 终端 Coding Agent", icon: "sparkles", iconColor: Visuals.flameOrange, badge: "官方推荐 · 零配置", badgeColor: Visuals.flameOrange) {
+            VStack(alignment: .leading, spacing: 10) {
+                Text("将 Monk 的 OpenAI 兼容融合模型（100 万上下文 / Agent 原生调优）与极速终端 Agent 深度结合。无需手写繁琐配置，预置 `monk-coding` 专属模型优化。")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+
+                HStack(spacing: 10) {
+                    // 命令 1: npx monk-pi
+                    HStack(spacing: 6) {
+                        Text("npx monk-pi")
+                            .font(.system(.caption2, design: .monospaced).weight(.medium))
+                        Spacer()
+                        Button {
+                            model.copyMonkPiNpx()
+                        } label: {
+                            HStack(spacing: 3) {
+                                Image(systemName: model.copiedMonkPiNpx ? "checkmark" : "doc.on.doc")
+                                Text(model.copiedMonkPiNpx ? "已复制" : "免安装即跑")
+                            }
+                            .font(.system(size: 10))
+                        }
+                        .buttonStyle(.borderless)
+                        .foregroundStyle(Visuals.flameOrange)
+                    }
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(Color.primary.opacity(0.03))
+                    .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+
+                    // 命令 2: brew install yaoleifly/tap/monk-pi
+                    HStack(spacing: 6) {
+                        Text("brew install ...")
+                            .font(.system(.caption2, design: .monospaced).weight(.medium))
+                        Spacer()
+                        Button {
+                            model.copyMonkPiBrew()
+                        } label: {
+                            HStack(spacing: 3) {
+                                Image(systemName: model.copiedMonkPiBrew ? "checkmark" : "doc.on.doc")
+                                Text(model.copiedMonkPiBrew ? "已复制" : "Homebrew")
+                            }
+                            .font(.system(size: 10))
+                        }
+                        .buttonStyle(.borderless)
+                        .foregroundStyle(Visuals.flameOrange)
+                    }
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 6)
+                    .background(Color.primary.opacity(0.03))
+                    .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+                }
+
+                HStack {
+                    Spacer()
+                    Button {
+                        model.openMonkPiGitHub()
+                    } label: {
+                        HStack(spacing: 4) {
+                            Text("在 GitHub 查看 yaoleifly/monk-pi")
+                            Image(systemName: "arrow.up.forward.app")
+                        }
+                        .font(.caption2.weight(.medium))
+                    }
+                    .buttonStyle(.link)
+                }
+            }
+        }
     }
 
     // MARK: - 未配置指引卡片
@@ -1586,6 +1788,14 @@ func selfCheck() {
 
     let attrWarn = makeStatusAttributedTitle(cost: 0.40, limit: 30.0, remainingMs: 1094400000, isBad: true, mode: .iconOnly)
     expect(attrWarn.string.contains("⚠︎"), "status title iconOnly warn")
+
+    // 有效期不足 3 天判定自检
+    expect(isExpiringSoon(cool) == true, "expiring soon cool (1ms)")
+    var longOrder = cool
+    longOrder.remainingMs = 10 * 86400 * 1000 // 10 days
+    expect(isExpiringSoon(longOrder) == false, "expiring soon 10d")
+    longOrder.remainingMs = 2 * 86400 * 1000 // 2 days
+    expect(isExpiringSoon(longOrder) == true, "expiring soon 2d")
 
     print("selfcheck ok")
 }
