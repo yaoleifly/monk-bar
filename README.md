@@ -1,21 +1,28 @@
 # MonkBar (macOS) ⚡️
 
 [![Release](https://img.shields.io/github/v/release/yaoleifly/monk-bar?color=orange&logo=apple)](https://github.com/yaoleifly/monk-bar/releases)
-[![Platform](https://img.shields.io/badge/Platform-macOS%2013%2B-black?logo=apple)](https://github.com/yaoleifly/monk-bar)
+[![Platform](https://img.shields.io/badge/Platform-macOS%2013%2B%20%7C%20Tahoe%2027%2B-black?logo=apple)](https://github.com/yaoleifly/monk-bar)
+[![Architecture](https://img.shields.io/badge/Architecture-Universal%202%20(arm64%20%2B%20x86__64)-blue?logo=apple)](https://github.com/yaoleifly/monk-bar)
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-专为 [monk.party](https://monk.party/) 打造的 macOS 极致体验菜单栏用量与限流监控小工具。纯原生 Swift + SwiftUI 打造，严格遵循 Apple Human Interface Guidelines 设计规范，零第三方依赖。
+专为 [monk.party](https://monk.party/) 打造的 macOS 极致体验菜单栏用量与限流监控小工具。纯原生 Swift + SwiftUI 打造，严格遵循 Apple Human Interface Guidelines 设计规范，零第三方依赖。**全面原生适配 macOS Tahoe (macOS 27+) 及 macOS 13+**。
 
 ---
 
 ## ✨ 核心特性
 
-### 1. 订阅临期提醒与续费引导（< 3 天）
+### 1. 原生支持 macOS Tahoe (macOS 27+) 与 Universal 2 双架构
+- **Universal 2 通用二进制**：单文件内嵌原生 `arm64`（Apple Silicon M1/M2/M3/M4/M5）与 `x86_64`（Intel）架构，在任何 Mac 上均无缝原生运行，告别 Rosetta 转译损耗。
+- **macOS Tahoe 动态状态栏与刘海适配**：
+  - 启用 `item.autosaveName`，支持按住 `⌘`（Command）自由拖拽状态栏图标位置，支持动态刘海与多屏记忆；
+  - 采用现代 Apple 液体视觉材质规范（`NSVisualEffectView` 与 Grouped 模块），深度适配浅色/深色模式。
+
+### 2. 订阅临期提醒与续费引导（< 3 天）
 - **智能预警机制**：当月卡剩余有效期不足 3 天（或已到期）时，状态栏自动亮起 `⚠︎` 橙色提示。
 - **菜单栏置顶快捷入口**：点击状态栏图标，首行呈现高亮入口 `🔥 订阅即将到期 (剩余 X 天) · 点击续订 ↗`，直达官方开通新套餐。
 - **Bento 仪表盘置顶预警卡片**：在设置中心顶部展示专属燃橙提醒横幅，一键直达 [monk.party](https://monk.party/) 续费，避免 Coding Agent 与开发调用意外中断。
 
-### 2. 官方推荐搭配：Monk × Pi (`monk-pi`) 终端 Coding Agent
+### 3. 官方推荐搭配：Monk × Pi (`monk-pi`) 终端 Coding Agent
 - **开箱即用 · 零配置终端编程助手**：将 Monk 的 100 万上下文与 Pi 极速终端 Agent 深度结合。
 - **预置专属优化**：默认适配 `monk-coding` 主力编程模型，无需手写繁琐的 `models.json` 和 `compat` 参数。
 - **快速安装运行**：
@@ -23,23 +30,22 @@
   - **Homebrew 安装**：`brew install yaoleifly/tap/monk-pi`
   - 开源仓库：👉 **[yaoleifly/monk-pi](https://github.com/yaoleifly/monk-pi)**
 
-### 3. 状态栏极致视觉与三档显示模式
-- **自适应矢量模板图标**：内置 18×18 矢量贝塞尔绘制的僧侣火焰剪影（`isTemplate = true`），根据 macOS 浅色/深色模式及点击高亮态自动融合反色。
-- **高阶 Attributed 数字排版**：采用 Apple 等宽数字字体（`monospacedDigitSystemFont`），主数值醒目、副指标低饱和度弱化，刷新时状态栏数字绝不产生像素级抖动。
+### 4. 状态栏极致视觉与三档显示模式
+- **自适应矢量模板图标**：内置 18×18 矢量贝塞尔绘制的僧侣火焰剪影（`isTemplate = true`），根据系统层级与对比度自动反色。
+- **高阶 Attributed 数字排版**：采用 Apple 等宽数字字体（`monospacedDigitSystemFont`），主数值醒目、副指标低饱和度弱化，刷新零抖动。
 - **三档显示样式，一键切换**（支持菜单栏或设置面板切换）：
   - **详细模式**：`[图标] ¥0.40 (1%) · 12d`（今日用量 + 消耗百分比 + 剩余有效天数）
   - **紧凑模式**：`[图标] ¥0.40`（极简显示今日内部计量）
   - **仅图标模式**：`[图标]`（纯粹无干扰，仅在异常时点缀 `⚠︎`）
 
-### 4. 实时状态与配额中心 (Bento Grid 仪表盘)
-针对开发者高频查用量、防 429 罚则的痛点，彻底告别单调纯文本，全面升级为现代化 **Apple Bento Grid** 模块化卡片布局：
+### 5. 实时状态与配额中心 (Bento Grid 仪表盘)
 - **🔥 今日内部计量熔断仪表 (Daily Fuse)**：大号高光数字 `¥0.40 / ¥30.00` + 动态平滑渐变能量槽（>80% 变红警戒）。
 - **⏱️ 订阅有效期与健康度卡片**：倒计时 `12 天 16 小时` 与到期具体时间。
 - **📊 Token 吞吐与分流条 (Token Analytics)**：Prompt（输入冷蓝）与 Completion（输出燃橙）双段对比。
 - **🛡️ 双滑动窗口限流调度面板 (Rate Limits & Fairness)**：1 小时与 6 小时滑动窗口加权请求与吞吐量监控 + 并发/突发令牌桶胶囊。
 - **💻 开发者快速集成卡片**：API Key、Base URL 一键复制，模型标签说明。
 
-### 5. 应用图标设计 (AppIcon)
+### 6. 应用图标设计 (AppIcon)
 - 提取 [monk.party](https://monk.party/) 标志性的「**僧侣结印 / 冥想火焰**」剪影。
 - 1024×1024 标准画布，824×824 主体 Squircle（连续平滑圆角 185px）。
 - 双层柔和立体弥散投影，深空钛黑渐变背景（`#1E293B` → `#0F172A` → `#030712`），边缘配有 1px 细微内沿高光。
@@ -50,7 +56,7 @@
 ## 📥 下载与安装
 
 ### 方式一：直接下载发布包（推荐）
-前往 **[Releases 页面](https://github.com/yaoleifly/monk-bar/releases)** 下载最新的 `MonkUsage-v1.2.0-macOS.zip`，解压后将 `Monk 用量.app` 拖入 `/Applications`（应用程序）即可。
+前往 **[Releases 页面](https://github.com/yaoleifly/monk-bar/releases)** 下载最新的 `MonkUsage-v1.3.0-macOS-Tahoe-Universal.zip`，解压后将 `Monk 用量.app` 拖入 `/Applications`（应用程序）即可。
 
 ### 方式二：本地一键构建
 

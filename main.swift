@@ -427,6 +427,29 @@ func makeStatusAttributedTitle(
     return result
 }
 
+// MARK: - 系统适配与信息 (macOS 13+ / macOS Tahoe 27+)
+
+enum SystemInfo {
+    static var macOSName: String {
+        let v = ProcessInfo.processInfo.operatingSystemVersion
+        switch v.majorVersion {
+        case 26, 27:
+            return "macOS Tahoe (\(v.majorVersion).\(v.minorVersion))"
+        case 15:
+            return "macOS Sequoia (15.\(v.minorVersion))"
+        case 14:
+            return "macOS Sonoma (14.\(v.minorVersion))"
+        case 13:
+            return "macOS Ventura (13.\(v.minorVersion))"
+        default:
+            if v.majorVersion >= 26 {
+                return "macOS Tahoe (\(v.majorVersion).\(v.minorVersion))"
+            }
+            return "macOS (\(v.majorVersion).\(v.minorVersion))"
+        }
+    }
+}
+
 // MARK: - 菜单栏 App
 
 final class Agent: NSObject, NSMenuDelegate {
@@ -441,6 +464,7 @@ final class Agent: NSObject, NSMenuDelegate {
     func start() {
         NSApp.setActivationPolicy(.accessory)
         displayMode = StatusDisplayMode(rawValue: UserDefaults.standard.string(forKey: "monkStatusDisplayMode") ?? "") ?? .detailed
+        item.autosaveName = "party.monk.usage.statusItem"
         item.button?.image = Visuals.makeMenuIcon()
         item.button?.imagePosition = .imageLeft
         item.menu = NSMenu(title: "monk")
@@ -1031,9 +1055,19 @@ struct SettingsView: View {
                     statusBadge
                 }
 
-                Text("OpenAI 兼容融合网关 (monk / monk-fast / monk-coding)")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                HStack(spacing: 6) {
+                    Text("OpenAI 兼容融合网关 (monk / monk-fast / monk-coding)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+
+                    Text("·")
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+
+                    Text(SystemInfo.macOSName)
+                        .font(.system(size: 10.5, weight: .medium))
+                        .foregroundStyle(.tertiary)
+                }
             }
 
             Spacer()
@@ -1796,6 +1830,8 @@ func selfCheck() {
     expect(isExpiringSoon(longOrder) == false, "expiring soon 10d")
     longOrder.remainingMs = 2 * 86400 * 1000 // 2 days
     expect(isExpiringSoon(longOrder) == true, "expiring soon 2d")
+
+    expect(!SystemInfo.macOSName.isEmpty, "macOSName non-empty")
 
     print("selfcheck ok")
 }
