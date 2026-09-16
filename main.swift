@@ -137,6 +137,78 @@ enum Cfg {
     }
 }
 
+// MARK: - 自动更新检查 (GitHub Releases API)
+
+struct UpdateInfo {
+    let latestVersion: String
+    let releaseNotes: String?
+    let htmlURL: URL
+    let downloadURL: URL?
+}
+
+enum UpdateChecker {
+    static let apiURL = URL(string: "https://api.github.com/repos/yaoleifly/monk-bar/releases/latest")!
+    static let currentVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.3.1"
+
+    /// 比较 semver：latest > current 返回 true
+    static func isNewer(latest: String, current: String) -> Bool {
+        let cleanLatest = latest.trimmingCharacters(in: CharacterSet(charactersIn: "vV")).trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanCurrent = current.trimmingCharacters(in: CharacterSet(charactersIn: "vV")).trimmingCharacters(in: .whitespacesAndNewlines)
+        let v1 = cleanLatest.split(separator: ".").compactMap { Int($0) }
+        let v2 = cleanCurrent.split(separator: ".").compactMap { Int($0) }
+        for (a, b) in zip(v1, v2) {
+            if a > b { return true }
+            if a < b { return false }
+        }
+        return v1.count > v2.count
+    }
+
+    static func check(completion: @escaping (UpdateInfo?, String?) -> Void) {
+        var req = URLRequest(url: apiURL)
+        req.timeoutInterval = 10
+        req.setValue("application/vnd.github.v3+json", forHTTPHeaderField: "Accept")
+        req.setValue("MonkBar-macOS-Updater", forHTTPHeaderField: "User-Agent")
+
+        URLSession.shared.dataTask(with: req) { data, resp, err in
+            let main: (UpdateInfo?, String?) -> Void = { u, e in
+                DispatchQueue.main.async { completion(u, e) }
+            }
+            if let err = err {
+                main(nil, err.localizedDescription)
+                return
+            }
+            guard let data = data,
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let tagName = json["tag_name"] as? String,
+                  let htmlUrlStr = json["html_url"] as? String,
+                  let htmlURL = URL(string: htmlUrlStr) else {
+                main(nil, "无法解析 GitHub 更新数据")
+                return
+            }
+
+            let notes = json["body"] as? String
+            var dlURL: URL? = nil
+            if let assets = json["assets"] as? [[String: Any]],
+               let first = assets.first,
+               let dlStr = first["browser_download_url"] as? String {
+                dlURL = URL(string: dlStr)
+            }
+
+            if isNewer(latest: tagName, current: currentVersion) {
+                let info = UpdateInfo(
+                    latestVersion: tagName,
+                    releaseNotes: notes,
+                    htmlURL: htmlURL,
+                    downloadURL: dlURL
+                )
+                main(info, nil)
+            } else {
+                main(nil, nil)
+            }
+        }.resume()
+    }
+}
+
 // MARK: - 接口模型
 
 struct UsageWindow: Codable { var w: Double?; var pin: Double? }
@@ -460,12 +532,15 @@ final class Agent: NSObject, NSMenuDelegate {
     var note: String?
     var autoRefresh = false
     var displayMode: StatusDisplayMode = .detailed
+    var autoCheckUpdates = true
+    var availableUpdate: UpdateInfo? = nil
     var timer: Timer?
 
     func start() {
         NSApp.setActivationPolicy(.accessory)
         setupMainMenu()
         displayMode = StatusDisplayMode(rawValue: UserDefaults.standard.string(forKey: "monkStatusDisplayMode") ?? "") ?? .detailed
+        autoCheckUpdates = UserDefaults.standard.object(forKey: "monkAutoCheckUpdates") as? Bool ?? true
         item.autosaveName = "party.monk.usage.statusItem"
         item.button?.image = Visuals.makeMenuIcon()
         item.button?.imagePosition = .imageLeft
@@ -476,6 +551,12 @@ final class Agent: NSObject, NSMenuDelegate {
         // 首次运行（或配置不可用）直接弹设置窗，避免被迫找文件
         if Cfg.load() == nil {
             DispatchQueue.main.async { [weak self] in self?.doSettings() }
+        }
+        // 启动后延迟 3 秒静默检查更新（若开启了自动检查）
+        if autoCheckUpdates {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [weak self] in
+                self?.checkForUpdates(silent: true)
+            }
         }
     }
 
@@ -548,10 +629,18 @@ final class Agent: NSObject, NSMenuDelegate {
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
 
-        // 当有效期不足 3 天或已到期时，置顶醒目引导续费新套餐
+        // 发现新版本
+        if let update = availableUpdate {
+            let updateItem = NSMenuItem(title: "✨ 新版本 \(update.latestVersion) · 更新 ↗", action: #selector(doOpenUpdate), keyEquivalent: "")
+            updateItem.target = self
+            menu.addItem(updateItem)
+            menu.addItem(.separator())
+        }
+
+        // 临期续费
         if let o = order, isExpiringSoon(o) {
             let daysLeft = Fmt.left(o.remainingMs, expired: o.expired == true)
-            let title = o.expired == true ? "⚠️ 订阅已到期 · 立即续订新套餐 ↗" : "🔥 订阅即将到期 (剩余 \(daysLeft)) · 立即续订 ↗"
+            let title = o.expired == true ? "⚠️ 订阅已到期 · 续订 ↗" : "🔥 仅剩 \(daysLeft) · 续订 ↗"
             let renewItem = NSMenuItem(title: title, action: #selector(doOpenPricing), keyEquivalent: "")
             renewItem.target = self
             menu.addItem(renewItem)
@@ -566,21 +655,19 @@ final class Agent: NSObject, NSMenuDelegate {
         refresh.target = self
         menu.addItem(refresh)
 
-        // 状态栏显示模式子菜单
-        let styleItem = NSMenuItem(title: "状态栏显示样式", action: nil, keyEquivalent: "")
-        let styleSubmenu = NSMenu(title: "状态栏显示样式")
-
-        let modeDetailed = NSMenuItem(title: "详细模式 (额度 + 百分比 + 剩余天数)", action: #selector(selectModeDetailed), keyEquivalent: "")
+        let styleItem = NSMenuItem(title: "显示样式", action: nil, keyEquivalent: "")
+        let styleSubmenu = NSMenu(title: "显示样式")
+        let modeDetailed = NSMenuItem(title: "详细 (额度 + 百分比 + 剩余)", action: #selector(selectModeDetailed), keyEquivalent: "")
         modeDetailed.target = self
         modeDetailed.state = displayMode == .detailed ? .on : .off
         styleSubmenu.addItem(modeDetailed)
 
-        let modeCompact = NSMenuItem(title: "紧凑模式 (仅今日内部计量)", action: #selector(selectModeCompact), keyEquivalent: "")
+        let modeCompact = NSMenuItem(title: "紧凑 (仅今日额度)", action: #selector(selectModeCompact), keyEquivalent: "")
         modeCompact.target = self
         modeCompact.state = displayMode == .compact ? .on : .off
         styleSubmenu.addItem(modeCompact)
 
-        let modeIconOnly = NSMenuItem(title: "仅图标模式 (极简，有异常才提示)", action: #selector(selectModeIconOnly), keyEquivalent: "")
+        let modeIconOnly = NSMenuItem(title: "仅图标 (极简)", action: #selector(selectModeIconOnly), keyEquivalent: "")
         modeIconOnly.target = self
         modeIconOnly.state = displayMode == .iconOnly ? .on : .off
         styleSubmenu.addItem(modeIconOnly)
@@ -588,37 +675,34 @@ final class Agent: NSObject, NSMenuDelegate {
         styleItem.submenu = styleSubmenu
         menu.addItem(styleItem)
 
-        let auto = NSMenuItem(title: "自动刷新（5 分钟）", action: #selector(toggleAuto), keyEquivalent: "")
+        let auto = NSMenuItem(title: "后台刷新 (5分钟)", action: #selector(toggleAuto), keyEquivalent: "")
         auto.target = self
         auto.state = autoRefresh ? .on : .off
-        auto.indentationLevel = 1
         menu.addItem(auto)
-        if autoRefresh {
-            menu.addItem(info("官方按查询计一次今日用量，已放缓为 5 分钟一次", multiline: true))
-        }
 
         menu.addItem(.separator())
-        let acct = NSMenuItem(title: "打开账户页", action: #selector(doAccount), keyEquivalent: "a")
+        let acct = NSMenuItem(title: "打开账户页 ↗", action: #selector(doAccount), keyEquivalent: "a")
         acct.keyEquivalentModifierMask = [.command, .shift]
         acct.target = self
         menu.addItem(acct)
 
-        // 推荐搭配的 Monk-Pi Coding Agent 工具
-        let monkPiItem = NSMenuItem(title: "⚡️ 推荐 Agent 工具：Monk-Pi 终端助手 ↗", action: #selector(doOpenMonkPi), keyEquivalent: "")
+        let monkPiItem = NSMenuItem(title: "推荐 Monk-Pi ↗", action: #selector(doOpenMonkPi), keyEquivalent: "")
         monkPiItem.target = self
         menu.addItem(monkPiItem)
 
-        // 官方使用倡议书
-        let charterItem = NSMenuItem(title: "📜 Monk 使用倡议书 ↗", action: #selector(doCharter), keyEquivalent: "")
+        let charterItem = NSMenuItem(title: "使用倡议书 ↗", action: #selector(doCharter), keyEquivalent: "")
         charterItem.target = self
         menu.addItem(charterItem)
 
-        let conf = NSMenuItem(title: "设置账号…", action: #selector(doSettings), keyEquivalent: ",")
+        menu.addItem(.separator())
+        let conf = NSMenuItem(title: "设置…", action: #selector(doSettings), keyEquivalent: ",")
         conf.target = self
         menu.addItem(conf)
-        let raw = NSMenuItem(title: "打开配置文件", action: #selector(doConfig), keyEquivalent: "")
-        raw.target = self
-        menu.addItem(raw)
+
+        let checkUpdateItem = NSMenuItem(title: "检查更新…", action: #selector(doCheckUpdateManual), keyEquivalent: "")
+        checkUpdateItem.target = self
+        menu.addItem(checkUpdateItem)
+
         let quit = NSMenuItem(title: "退出", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         menu.addItem(quit)
     }
@@ -626,19 +710,19 @@ final class Agent: NSObject, NSMenuDelegate {
     func addOrderItems(to menu: NSMenu, _ o: Order) {
         let st = state(o)
         menu.addItem(info("状态　\(st.label)"))
-        menu.addItem(info("Key　　\(masked(o.apiKey))　（点击复制）", action: #selector(doCopyKey), target: self))
-        menu.addItem(info("剩余　\(Fmt.left(o.remainingMs, expired: o.expired == true))　到期 \(Fmt.date(o.expiresAt))"))
-        menu.addItem(info("今日　\(Fmt.bar(o.dailyCost, o.dailyLimit)) \(Fmt.money(o.dailyCost)) / \(Fmt.money(o.dailyLimit))　保险丝，UTC 00:00 清零"))
-        menu.addItem(info("Token　累计 \(Fmt.tok(o.tokens?.total))　入 \(Fmt.tok(o.tokens?.prompt)) · 出 \(Fmt.tok(o.tokens?.completion))"))
+        menu.addItem(info("Key　　\(masked(o.apiKey))　(复制)", action: #selector(doCopyKey), target: self))
+        menu.addItem(info("剩余　\(Fmt.left(o.remainingMs, expired: o.expired == true)) · 到期 \(Fmt.date(o.expiresAt))"))
+        menu.addItem(info("今日　\(Fmt.bar(o.dailyCost, o.dailyLimit)) \(Fmt.money(o.dailyCost)) / \(Fmt.money(o.dailyLimit))"))
+        menu.addItem(info("Token　\(Fmt.tok(o.tokens?.total)) (入 \(Fmt.tok(o.tokens?.prompt)) · 出 \(Fmt.tok(o.tokens?.completion)))"))
 
         if let r = o.rateLimit, let fair = o.fairness {
             menu.addItem(.separator())
-            menu.addItem(info("1 小时　\(Fmt.bar(r.hour?.w, fair.hourMax)) \(Fmt.num(r.hour?.w))/\(Fmt.num(fair.hourMax)) 次 · \(Fmt.tok(r.hour?.pin))/\(Fmt.tok(fair.hourPrompt)) in"))
-            menu.addItem(info("6 小时　\(Fmt.bar(r.six?.w, fair.sixHourMax)) \(Fmt.num(r.six?.w))/\(Fmt.num(fair.sixHourMax)) 次 · \(Fmt.tok(r.six?.pin))/\(Fmt.tok(fair.sixHourPrompt)) in"))
-            menu.addItem(info("并发　　每 Key \(Fmt.num(fair.inflightPerKey)) 路 · 全站 \(Fmt.num(fair.inflightGlobal)) 路 · 桶 \(Fmt.num(fair.burstCapacity))/补 \(Fmt.num(fair.burstRefillPerMin)) 每分钟"))
+            menu.addItem(info("1 小时　\(Fmt.num(r.hour?.w))/\(Fmt.num(fair.hourMax)) 次 · \(Fmt.tok(r.hour?.pin)) in"))
+            menu.addItem(info("6 小时　\(Fmt.num(r.six?.w))/\(Fmt.num(fair.sixHourMax)) 次 · \(Fmt.tok(r.six?.pin)) in"))
+            menu.addItem(info("并发　　每Key \(Fmt.num(fair.inflightPerKey)) 路 · 全站 \(Fmt.num(fair.inflightGlobal)) 路"))
         }
         if let cd = o.cooldownUntil, Fmt.parse(cd)?.timeIntervalSinceNow ?? -1 > 0 {
-            menu.addItem(info("冷却　　至 \(Fmt.date(cd))（北京时间）"))
+            menu.addItem(info("冷却　　至 \(Fmt.date(cd))"))
         }
     }
 
@@ -680,6 +764,70 @@ final class Agent: NSObject, NSMenuDelegate {
         NSWorkspace.shared.open(Cfg.charterPage)
     }
 
+    @objc func doOpenUpdate() {
+        if let update = availableUpdate {
+            NSWorkspace.shared.open(update.downloadURL ?? update.htmlURL)
+        } else {
+            NSWorkspace.shared.open(URL(string: "https://github.com/yaoleifly/monk-bar/releases")!)
+        }
+    }
+
+    @objc func doCheckUpdateManual() {
+        checkForUpdates(silent: false)
+    }
+
+    func setAutoCheckUpdates(_ enabled: Bool) {
+        self.autoCheckUpdates = enabled
+        UserDefaults.standard.set(enabled, forKey: "monkAutoCheckUpdates")
+    }
+
+    func checkForUpdates(silent: Bool, completion: ((Bool) -> Void)? = nil) {
+        UpdateChecker.check { [weak self] info, err in
+            guard let self = self else { return }
+            self.availableUpdate = info
+            self.item.menu?.delegate?.menuNeedsUpdate?(self.item.menu!)
+
+            if let info = info {
+                if !silent {
+                    self.promptUpdateAvailable(info)
+                }
+                completion?(true)
+            } else {
+                if !silent {
+                    if let err = err {
+                        let alert = NSAlert()
+                        alert.messageText = "检查更新失败"
+                        alert.informativeText = "无法连接至 GitHub (\(err))，请检查网络。"
+                        alert.addButton(withTitle: "好")
+                        alert.runModal()
+                    } else {
+                        self.promptUpToDate()
+                    }
+                }
+                completion?(false)
+            }
+        }
+    }
+
+    func promptUpdateAvailable(_ info: UpdateInfo) {
+        let alert = NSAlert()
+        alert.messageText = "发现 MonkBar 新版本 \(info.latestVersion)"
+        alert.informativeText = "当前版本：v\(UpdateChecker.currentVersion)\n最新版本：\(info.latestVersion)"
+        alert.addButton(withTitle: "前往下载更新")
+        alert.addButton(withTitle: "稍后再说")
+        if alert.runModal() == .alertFirstButtonReturn {
+            NSWorkspace.shared.open(info.downloadURL ?? info.htmlURL)
+        }
+    }
+
+    func promptUpToDate() {
+        let alert = NSAlert()
+        alert.messageText = "已是最新版本"
+        alert.informativeText = "MonkBar v\(UpdateChecker.currentVersion) 已是最新版。"
+        alert.addButton(withTitle: "好")
+        alert.runModal()
+    }
+
     @objc func doOpenMonkPi() {
         NSWorkspace.shared.open(URL(string: "https://github.com/yaoleifly/monk-pi")!)
     }
@@ -693,7 +841,6 @@ final class Agent: NSObject, NSMenuDelegate {
         UserDefaults.standard.set(autoRefresh, forKey: "monkAutoRefresh")
         timer?.invalidate()
         if autoRefresh {
-            // 官方明示「一次查询计算一次今日用量」，故下限 300s，不做秒表。
             timer = Timer.scheduledTimer(withTimeInterval: 300, repeats: true) { [weak self] _ in
                 self?.refreshIfNeeded()
             }
@@ -719,7 +866,7 @@ final class Agent: NSObject, NSMenuDelegate {
         let pb = NSPasteboard.general
         pb.clearContents()
         pb.setString(key, forType: .string)
-        note = "API Key 已复制到剪贴板"
+        note = "API Key 已复制"
         render()
     }
 
@@ -732,18 +879,25 @@ final class Agent: NSObject, NSMenuDelegate {
     }
 }
 
-// MARK: - Apple HIG 极致体验设置与实时监控中心 (SwiftUI + AppKit)
+// MARK: - 精简高效设置面板与实时看板 (SwiftUI + AppKit)
 
 final class SettingsViewModel: ObservableObject {
     @Published var email: String = ""
     @Published var tradeNo: String = ""
     @Published var autoRefresh: Bool = false
     @Published var statusDisplayMode: StatusDisplayMode = .detailed
+    @Published var autoCheckUpdates: Bool = true
+    @Published var checkingUpdate: Bool = false
+    @Published var updateResultNote: String? = nil
     @Published var validationError: String? = nil
     @Published var saveSuccess: Bool = false
     @Published var isRefreshing: Bool = false
     @Published var copiedKey: Bool = false
     @Published var copiedBaseURL: Bool = false
+    @Published var copiedEmail: Bool = false
+    @Published var copiedTradeNo: Bool = false
+    @Published var copiedMonkPiNpx: Bool = false
+    @Published var copiedMonkPiBrew: Bool = false
 
     weak var agent: Agent?
 
@@ -754,21 +908,23 @@ final class SettingsViewModel: ObservableObject {
         self.tradeNo = cfg?.tradeNo ?? ""
         self.autoRefresh = agent.autoRefresh
         self.statusDisplayMode = agent.displayMode
+        self.autoCheckUpdates = agent.autoCheckUpdates
         self.validationError = nil
         self.saveSuccess = false
         self.copiedKey = false
         self.copiedBaseURL = false
+        self.copiedEmail = false
+        self.copiedTradeNo = false
+        self.copiedMonkPiNpx = false
+        self.copiedMonkPiBrew = false
     }
-
-    @Published var copiedEmail: Bool = false
-    @Published var copiedTradeNo: Bool = false
 
     func copyEmail() {
         guard !email.isEmpty else { return }
         let pb = NSPasteboard.general
         pb.clearContents()
         pb.setString(email, forType: .string)
-        withAnimation(.easeInOut(duration: 0.2)) { copiedEmail = true }
+        withAnimation(.easeInOut(duration: 0.15)) { copiedEmail = true }
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
             withAnimation { self?.copiedEmail = false }
         }
@@ -785,7 +941,7 @@ final class SettingsViewModel: ObservableObject {
         let pb = NSPasteboard.general
         pb.clearContents()
         pb.setString(tradeNo, forType: .string)
-        withAnimation(.easeInOut(duration: 0.2)) { copiedTradeNo = true }
+        withAnimation(.easeInOut(duration: 0.15)) { copiedTradeNo = true }
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
             withAnimation { self?.copiedTradeNo = false }
         }
@@ -801,9 +957,9 @@ final class SettingsViewModel: ObservableObject {
         let pb = NSPasteboard.general
         pb.clearContents()
         pb.setString(key, forType: .string)
-        withAnimation(.easeInOut(duration: 0.2)) { copiedKey = true }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
-            withAnimation(.easeInOut(duration: 0.2)) { self?.copiedKey = false }
+        withAnimation(.easeInOut(duration: 0.15)) { copiedKey = true }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+            withAnimation { self?.copiedKey = false }
         }
     }
 
@@ -811,22 +967,19 @@ final class SettingsViewModel: ObservableObject {
         let pb = NSPasteboard.general
         pb.clearContents()
         pb.setString("https://monk.party/v1", forType: .string)
-        withAnimation(.easeInOut(duration: 0.2)) { copiedBaseURL = true }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
-            withAnimation(.easeInOut(duration: 0.2)) { self?.copiedBaseURL = false }
+        withAnimation(.easeInOut(duration: 0.15)) { copiedBaseURL = true }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+            withAnimation { self?.copiedBaseURL = false }
         }
     }
-
-    @Published var copiedMonkPiNpx: Bool = false
-    @Published var copiedMonkPiBrew: Bool = false
 
     func copyMonkPiNpx() {
         let pb = NSPasteboard.general
         pb.clearContents()
         pb.setString("npx monk-pi", forType: .string)
-        withAnimation(.easeInOut(duration: 0.2)) { copiedMonkPiNpx = true }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
-            withAnimation(.easeInOut(duration: 0.2)) { self?.copiedMonkPiNpx = false }
+        withAnimation(.easeInOut(duration: 0.15)) { copiedMonkPiNpx = true }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+            withAnimation { self?.copiedMonkPiNpx = false }
         }
     }
 
@@ -834,9 +987,9 @@ final class SettingsViewModel: ObservableObject {
         let pb = NSPasteboard.general
         pb.clearContents()
         pb.setString("brew install yaoleifly/tap/monk-pi", forType: .string)
-        withAnimation(.easeInOut(duration: 0.2)) { copiedMonkPiBrew = true }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
-            withAnimation(.easeInOut(duration: 0.2)) { self?.copiedMonkPiBrew = false }
+        withAnimation(.easeInOut(duration: 0.15)) { copiedMonkPiBrew = true }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+            withAnimation { self?.copiedMonkPiBrew = false }
         }
     }
 
@@ -854,10 +1007,24 @@ final class SettingsViewModel: ObservableObject {
 
     func refreshNow() {
         guard let agent = agent, Cfg.load() != nil else { return }
-        withAnimation(.easeInOut(duration: 0.2)) { isRefreshing = true }
+        withAnimation(.easeInOut(duration: 0.15)) { isRefreshing = true }
         agent.refreshIfNeeded()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
-            withAnimation(.easeInOut(duration: 0.2)) { self?.isRefreshing = false }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
+            withAnimation { self?.isRefreshing = false }
+        }
+    }
+
+    func checkUpdateManual() {
+        checkingUpdate = true
+        updateResultNote = nil
+        agent?.checkForUpdates(silent: false) { [weak self] hasUpdate in
+            self?.checkingUpdate = false
+            if !hasUpdate {
+                self?.updateResultNote = "已是最新版"
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
+                    self?.updateResultNote = nil
+                }
+            }
         }
     }
 
@@ -866,12 +1033,12 @@ final class SettingsViewModel: ObservableObject {
         let t = tradeNo.trimmingCharacters(in: .whitespacesAndNewlines)
 
         if e.isEmpty || !e.contains("@") {
-            validationError = "请填写有效的下单邮箱地址"
+            validationError = "邮箱格式不正确"
             saveSuccess = false
             return
         }
         if t.isEmpty {
-            validationError = "请填写购买订单号（形如 MK...）"
+            validationError = "订单号不可为空"
             saveSuccess = false
             return
         }
@@ -893,6 +1060,9 @@ final class SettingsViewModel: ObservableObject {
             if agent.displayMode != statusDisplayMode {
                 agent.setDisplayMode(statusDisplayMode)
             }
+            if agent.autoCheckUpdates != autoCheckUpdates {
+                agent.setAutoCheckUpdates(autoCheckUpdates)
+            }
             withAnimation { isRefreshing = true }
             agent.note = nil
             agent.refreshIfNeeded()
@@ -901,7 +1071,7 @@ final class SettingsViewModel: ObservableObject {
         withAnimation(.spring()) {
             saveSuccess = true
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
             withAnimation {
                 self?.saveSuccess = false
                 self?.isRefreshing = false
@@ -921,20 +1091,20 @@ struct MetricCard<Content: View>: View {
     @ViewBuilder var content: Content
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 6) {
                 Image(systemName: icon)
-                    .font(.system(size: 13, weight: .semibold))
+                    .font(.system(size: 12, weight: .semibold))
                     .foregroundStyle(iconColor)
                 Text(title)
-                    .font(.system(size: 12, weight: .semibold))
+                    .font(.system(size: 11.5, weight: .semibold))
                     .foregroundStyle(.secondary)
                 Spacer()
                 if let badge = badge {
                     Text(badge)
-                        .font(.system(size: 10, weight: .semibold))
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 2)
+                        .font(.system(size: 9.5, weight: .semibold))
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 1.5)
                         .background(badgeColor.opacity(0.12))
                         .foregroundStyle(badgeColor)
                         .clipShape(Capsule())
@@ -942,11 +1112,11 @@ struct MetricCard<Content: View>: View {
             }
             content
         }
-        .padding(14)
+        .padding(12)
         .background(Color(NSColor.controlBackgroundColor))
-        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
         .overlay(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
                 .stroke(Color.primary.opacity(0.06), lineWidth: 1)
         )
     }
@@ -967,13 +1137,13 @@ struct GaugeBar: View {
             ZStack(alignment: .leading) {
                 Capsule()
                     .fill(Color.primary.opacity(0.08))
-                    .frame(height: 7)
+                    .frame(height: 6)
                 Capsule()
                     .fill(LinearGradient(colors: tintColors, startPoint: .leading, endPoint: .trailing))
-                    .frame(width: max(7, geo.size.width * pct), height: 7)
+                    .frame(width: max(6, geo.size.width * pct), height: 6)
             }
         }
-        .frame(height: 7)
+        .frame(height: 6)
     }
 }
 
@@ -985,30 +1155,30 @@ struct TokenSegmentBar: View {
     var promptPct: Double { prompt / total }
 
     var body: some View {
-        VStack(spacing: 8) {
+        VStack(spacing: 6) {
             GeometryReader { geo in
-                HStack(spacing: 3) {
+                HStack(spacing: 2) {
                     Capsule()
                         .fill(LinearGradient(colors: [Color.blue, Color.indigo], startPoint: .leading, endPoint: .trailing))
-                        .frame(width: max(6, geo.size.width * promptPct))
+                        .frame(width: max(4, geo.size.width * promptPct))
                     Capsule()
                         .fill(LinearGradient(colors: [Visuals.flameOrange, Visuals.flameGold], startPoint: .leading, endPoint: .trailing))
-                        .frame(width: max(6, geo.size.width * (1.0 - promptPct)))
+                        .frame(width: max(4, geo.size.width * (1.0 - promptPct)))
                 }
             }
-            .frame(height: 7)
+            .frame(height: 6)
 
             HStack {
                 HStack(spacing: 4) {
-                    Circle().fill(Color.blue).frame(width: 7, height: 7)
-                    Text("输入 Prompt: \(Fmt.tok(prompt)) (\(String(format: "%.1f", promptPct * 100))%)")
+                    Circle().fill(Color.blue).frame(width: 6, height: 6)
+                    Text("输入: \(Fmt.tok(prompt)) (\(String(format: "%.1f", promptPct * 100))%)")
                         .font(.caption2.monospacedDigit())
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
                 HStack(spacing: 4) {
-                    Circle().fill(Visuals.flameOrange).frame(width: 7, height: 7)
-                    Text("输出 Output: \(Fmt.tok(completion)) (\(String(format: "%.1f", (1.0 - promptPct) * 100))%)")
+                    Circle().fill(Visuals.flameOrange).frame(width: 6, height: 6)
+                    Text("输出: \(Fmt.tok(completion)) (\(String(format: "%.1f", (1.0 - promptPct) * 100))%)")
                         .font(.caption2.monospacedDigit())
                         .foregroundStyle(.secondary)
                 }
@@ -1031,7 +1201,7 @@ struct RateLimitRow: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
+        VStack(alignment: .leading, spacing: 3) {
             HStack {
                 Text(title)
                     .font(.caption2)
@@ -1058,104 +1228,98 @@ struct SettingsView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            // 1. 顶部 Header (包含品牌图标、状态徽章与即时刷新按钮)
+            // Header
             headerView
-                .padding(.horizontal, 22)
-                .padding(.top, 18)
-                .padding(.bottom, 14)
+                .padding(.horizontal, 20)
+                .padding(.top, 16)
+                .padding(.bottom, 12)
 
             Divider()
 
-            // 2. 主体可滚动仪表盘 (ScrollView)
+            // 主体
             ScrollView(.vertical, showsIndicators: true) {
-                VStack(spacing: 16) {
+                VStack(spacing: 12) {
+                    // 新版本提示
+                    if let u = model.agent?.availableUpdate {
+                        updateBanner(u)
+                    }
+
                     if let o = model.agent?.order {
-                        // 有效期不足 3 天或已过期时，置顶显示醒目续费卡片
+                        // 临期提醒
                         if isExpiringSoon(o) {
                             renewalBanner(o)
                         }
-                        // 订单已加载：展示全套 Bento Grid 仪表盘
+                        // Bento Grid
                         liveDashboard(o)
                     } else {
-                        // 未加载或未配置：引导卡片
                         unconfiguredCard
                     }
 
-                    // 推荐搭配的 Monk-Pi Coding Agent 工具卡片
+                    // Monk-Pi 工具
                     monkPiRecommendationCard
 
-                    // 凭据配置卡片
+                    // 凭据设置
                     credentialsCard
 
-                    // 通用偏好卡片
+                    // 偏好设置
                     preferencesCard
                 }
-                .padding(20)
+                .padding(16)
             }
 
             Divider()
 
-            // 3. 底部标准操作工具栏
+            // 底部操作栏
             bottomActionBar
         }
-        .frame(width: 560, height: 660)
+        .frame(width: 530, height: 620)
         .background(Color(NSColor.windowBackgroundColor))
     }
 
     // MARK: - Header
     private var headerView: some View {
-        HStack(spacing: 14) {
+        HStack(spacing: 12) {
             Image(nsImage: Visuals.appIconImage())
                 .resizable()
                 .aspectRatio(contentMode: .fit)
-                .frame(width: 48, height: 48)
-                .clipShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 11, style: .continuous)
-                        .stroke(Color.white.opacity(0.15), lineWidth: 1)
-                )
-                .shadow(color: Color.black.opacity(0.2), radius: 4, x: 0, y: 2)
+                .frame(width: 42, height: 42)
+                .clipShape(RoundedRectangle(cornerRadius: 9, style: .continuous))
+                .shadow(color: Color.black.opacity(0.12), radius: 3, y: 1)
 
-            VStack(alignment: .leading, spacing: 3) {
-                HStack(spacing: 8) {
-                    Text("Monk 实时监控与设置")
-                        .font(.system(size: 16, weight: .bold))
-
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 6) {
+                    Text("MonkBar")
+                        .font(.system(size: 15, weight: .bold))
                     statusBadge
                 }
-
-                HStack(spacing: 6) {
-                    Text("OpenAI 兼容融合网关 (monk / monk-fast / monk-coding)")
-                        .font(.caption)
+                HStack(spacing: 4) {
+                    Text("融合模型")
+                        .font(.caption2)
                         .foregroundStyle(.secondary)
-
                     Text("·")
-                        .font(.caption)
+                        .font(.caption2)
                         .foregroundStyle(.tertiary)
-
                     Text(SystemInfo.macOSName)
-                        .font(.system(size: 10.5, weight: .medium))
+                        .font(.caption2)
                         .foregroundStyle(.tertiary)
                 }
             }
 
             Spacer()
 
-            // 立即刷新按钮
             Button {
                 model.refreshNow()
             } label: {
-                HStack(spacing: 5) {
+                HStack(spacing: 4) {
                     Image(systemName: "arrow.clockwise")
                         .rotationEffect(model.isRefreshing ? .degrees(360) : .zero)
                         .animation(model.isRefreshing ? .linear(duration: 0.8).repeatForever(autoreverses: false) : .default, value: model.isRefreshing)
-                    Text(model.isRefreshing ? "正在同步…" : "立即刷新")
-                        .font(.caption.weight(.medium))
+                    Text(model.isRefreshing ? "同步中…" : "刷新")
+                        .font(.caption)
                 }
-                .padding(.horizontal, 10)
-                .padding(.vertical, 5)
             }
             .buttonStyle(.bordered)
+            .controlSize(.small)
             .disabled(model.isRefreshing || Cfg.load() == nil)
         }
     }
@@ -1165,50 +1329,110 @@ struct SettingsView: View {
         if let o = model.agent?.order {
             let st = state(o)
             Text(st.label)
-                .font(.system(size: 11, weight: .semibold))
-                .padding(.horizontal, 8)
-                .padding(.vertical, 2.5)
+                .font(.system(size: 10, weight: .semibold))
+                .padding(.horizontal, 6)
+                .padding(.vertical, 2)
                 .background(st.bad ? Color.red.opacity(0.12) : Color.green.opacity(0.12))
                 .foregroundStyle(st.bad ? Color.red : Color.green)
                 .clipShape(Capsule())
         } else if Cfg.load() == nil {
             Text("未配置")
-                .font(.system(size: 11, weight: .semibold))
-                .padding(.horizontal, 8)
-                .padding(.vertical, 2.5)
+                .font(.system(size: 10, weight: .semibold))
+                .padding(.horizontal, 6)
+                .padding(.vertical, 2)
                 .background(Color.orange.opacity(0.12))
                 .foregroundStyle(Color.orange)
                 .clipShape(Capsule())
         } else {
             Text("连接异常")
-                .font(.system(size: 11, weight: .semibold))
-                .padding(.horizontal, 8)
-                .padding(.vertical, 2.5)
+                .font(.system(size: 10, weight: .semibold))
+                .padding(.horizontal, 6)
+                .padding(.vertical, 2)
                 .background(Color.red.opacity(0.12))
                 .foregroundStyle(Color.red)
                 .clipShape(Capsule())
         }
     }
 
-    // MARK: - 实时状态与配额 Bento Grid
+    // MARK: - 新版本提示横幅
+    @ViewBuilder
+    private func updateBanner(_ u: UpdateInfo) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: "sparkles")
+                .font(.system(size: 13))
+                .foregroundStyle(.blue)
+
+            Text("新版本 \(u.latestVersion)")
+                .font(.caption.weight(.semibold))
+
+            Text("(当前 v\(UpdateChecker.currentVersion))")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+
+            Spacer()
+
+            Button("更新 ↗") {
+                NSWorkspace.shared.open(u.downloadURL ?? u.htmlURL)
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.small)
+            .tint(.blue)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(Color.blue.opacity(0.06))
+        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+
+    // MARK: - 到期续费横幅
+    @ViewBuilder
+    private func renewalBanner(_ o: Order) -> some View {
+        let daysLeft = Fmt.left(o.remainingMs, expired: o.expired == true)
+        HStack(spacing: 8) {
+            Image(systemName: "flame.fill")
+                .font(.system(size: 13))
+                .foregroundStyle(Visuals.flameOrange)
+
+            Text(o.expired == true ? "套餐已到期" : "套餐即将到期")
+                .font(.caption.weight(.bold))
+                .foregroundStyle(Visuals.flameOrange)
+
+            Text("剩余 \(daysLeft) · 到期 \(Fmt.date(o.expiresAt))")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+
+            Spacer()
+
+            Button("续费 ↗") {
+                model.openPricing()
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.small)
+            .tint(Visuals.flameOrange)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(Visuals.flameOrange.opacity(0.06))
+        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+
+    // MARK: - Bento Grid 实时用量
     private func liveDashboard(_ o: Order) -> some View {
-        VStack(spacing: 14) {
-            // Row 1: 双列核心指标卡片 (今日内部计量 + 订阅有效期限)
-            HStack(spacing: 14) {
-                // 卡片 1: 今日内部计量 (保险丝)
+        VStack(spacing: 10) {
+            // Row 1: 今日内部计量 + 订阅有效期限
+            HStack(spacing: 10) {
                 let cost = o.dailyCost ?? 0
                 let limit = max(0.01, o.dailyLimit ?? 30.0)
                 let pct = Int(min(100, max(0, (cost / limit) * 100)))
-                let remainCost = max(0, limit - cost)
 
-                MetricCard(title: "今日内部计量", icon: "flame.fill", iconColor: Visuals.flameOrange, badge: "熔断保险丝", badgeColor: Visuals.flameOrange) {
-                    VStack(alignment: .leading, spacing: 6) {
-                        HStack(alignment: .firstTextBaseline, spacing: 4) {
+                MetricCard(title: "今日内部计量", icon: "flame.fill", iconColor: Visuals.flameOrange, badge: "保险丝", badgeColor: Visuals.flameOrange) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack(alignment: .firstTextBaseline) {
                             Text(Fmt.money(cost))
-                                .font(.system(size: 22, weight: .bold, design: .rounded))
+                                .font(.system(size: 18, weight: .bold, design: .rounded))
                                 .foregroundStyle(pct > 80 ? .red : .primary)
                             Text("/ \(Fmt.money(limit))")
-                                .font(.caption.weight(.medium))
+                                .font(.caption2)
                                 .foregroundStyle(.secondary)
                             Spacer()
                             Text("\(pct)%")
@@ -1219,7 +1443,7 @@ struct SettingsView: View {
                         GaugeBar(value: cost, total: limit, tintColors: pct > 80 ? [.red, .orange] : [Visuals.flameOrange, Visuals.flameGold])
 
                         HStack {
-                            Text("剩余安全额度: \(Fmt.money(remainCost))")
+                            Text("剩余 \(Fmt.money(max(0, limit - cost)))")
                                 .font(.caption2)
                                 .foregroundStyle(.secondary)
                             Spacer()
@@ -1230,323 +1454,221 @@ struct SettingsView: View {
                     }
                 }
 
-                // 卡片 2: 订阅有效期与健康度
                 let (days, hours) = parseDaysHours(o.remainingMs)
                 let st = state(o)
 
-                MetricCard(title: "订阅有效期", icon: "calendar.badge.clock", iconColor: .blue, badge: st.label, badgeColor: st.bad ? .red : .green) {
-                    VStack(alignment: .leading, spacing: 6) {
-                        HStack(alignment: .firstTextBaseline, spacing: 4) {
+                MetricCard(title: "有效期限", icon: "calendar", iconColor: .blue, badge: st.label, badgeColor: st.bad ? .red : .green) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack(alignment: .firstTextBaseline, spacing: 3) {
                             if o.expired == true {
                                 Text("已到期")
-                                    .font(.system(size: 22, weight: .bold, design: .rounded))
+                                    .font(.system(size: 18, weight: .bold, design: .rounded))
                                     .foregroundStyle(.red)
                             } else {
-                                Text("\(days)")
-                                    .font(.system(size: 22, weight: .bold, design: .rounded))
-                                Text("天")
-                                    .font(.caption.weight(.medium))
-                                    .foregroundStyle(.secondary)
-                                Text("\(hours)")
-                                    .font(.system(size: 20, weight: .bold, design: .rounded))
-                                Text("小时")
-                                    .font(.caption.weight(.medium))
-                                    .foregroundStyle(.secondary)
+                                Text("\(days)").font(.system(size: 18, weight: .bold, design: .rounded))
+                                Text("天").font(.caption2).foregroundStyle(.secondary)
+                                Text("\(hours)").font(.system(size: 16, weight: .bold, design: .rounded))
+                                Text("时").font(.caption2).foregroundStyle(.secondary)
                             }
                             Spacer()
                         }
 
-                        Text("到期时间: \(Fmt.date(o.expiresAt))")
+                        Text("到期: \(Fmt.date(o.expiresAt))")
                             .font(.caption2)
                             .foregroundStyle(.secondary)
 
-                        HStack {
-                            Text(o.status == "paid" ? "月卡正常生效中" : "订单状态: \(o.status ?? "未知")")
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                            Spacer()
-                            if let cd = o.cooldownUntil, Fmt.parse(cd)?.timeIntervalSinceNow ?? -1 > 0 {
-                                Text("冷却至 \(Fmt.date(cd))")
-                                    .font(.caption2.weight(.medium))
-                                    .foregroundStyle(.orange)
-                            }
+                        if let cd = o.cooldownUntil, Fmt.parse(cd)?.timeIntervalSinceNow ?? -1 > 0 {
+                            Text("冷却至 \(Fmt.date(cd))")
+                                .font(.caption2.weight(.medium))
+                                .foregroundStyle(.orange)
                         }
                     }
                 }
             }
 
-            // Row 2: Token 消耗分流卡片
+            // Row 2: Token 消耗
             if let tok = o.tokens, let total = tok.total, total > 0 {
-                MetricCard(title: "累计 Token 吞吐与分流", icon: "gauge.with.dots.needle.bottom.50percent", iconColor: .indigo, badge: "总计 \(Fmt.tok(total))", badgeColor: .indigo) {
+                MetricCard(title: "Token 消耗", icon: "gauge", iconColor: .indigo, badge: "\(Fmt.tok(total))", badgeColor: .indigo) {
                     TokenSegmentBar(prompt: tok.prompt ?? 0, completion: tok.completion ?? 0)
                 }
             }
 
-            // Row 3: 双窗口限流与加权调度面板
+            // Row 3: 限流保护与调度
             if let r = o.rateLimit, let fair = o.fairness {
-                MetricCard(title: "限流保护与公平调度", icon: "shield.lefthalf.filled", iconColor: .teal, badge: "防 429 机制", badgeColor: .teal) {
-                    VStack(spacing: 12) {
-                        HStack(alignment: .top, spacing: 18) {
-                            // 1 小时窗口
-                            VStack(alignment: .leading, spacing: 8) {
-                                HStack {
-                                    Text("1 小时滑动窗口")
-                                        .font(.caption.weight(.semibold))
-                                    Spacer()
-                                }
+                MetricCard(title: "限流保护", icon: "shield.fill", iconColor: .teal, badge: "防 429", badgeColor: .teal) {
+                    VStack(spacing: 8) {
+                        HStack(alignment: .top, spacing: 12) {
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("1 小时窗口").font(.caption2.weight(.semibold))
                                 RateLimitRow(title: "加权请求", current: r.hour?.w ?? 0, maxVal: fair.hourMax ?? 60, isToken: false)
                                 RateLimitRow(title: "输入 Token", current: r.hour?.pin ?? 0, maxVal: fair.hourPrompt ?? 30_000_000, isToken: true)
                             }
-
-                            Divider().frame(height: 70)
-
-                            // 6 小时窗口
-                            VStack(alignment: .leading, spacing: 8) {
-                                HStack {
-                                    Text("6 小时滑动窗口")
-                                        .font(.caption.weight(.semibold))
-                                    Spacer()
-                                }
+                            Divider().frame(height: 50)
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("6 小时窗口").font(.caption2.weight(.semibold))
                                 RateLimitRow(title: "加权请求", current: r.six?.w ?? 0, maxVal: fair.sixHourMax ?? 200, isToken: false)
                                 RateLimitRow(title: "输入 Token", current: r.six?.pin ?? 0, maxVal: fair.sixHourPrompt ?? 120_000_000, isToken: true)
                             }
                         }
 
-                        // 并发与突发保护胶囊
-                        HStack(spacing: 8) {
-                            ruleCapsule(icon: "bolt.fill", title: "并发限制", detail: "单Key \(Fmt.num(fair.inflightPerKey))路 · 全站 \(Fmt.num(fair.inflightGlobal))路")
-                            ruleCapsule(icon: "archivebox.fill", title: "令牌桶突发", detail: "容量 \(Fmt.num(fair.burstCapacity)) · 补 \(Fmt.num(fair.burstRefillPerMin))次/分")
-                            ruleCapsule(icon: "exclamationmark.shield.fill", title: "429 罚则", detail: "连续 \(Fmt.num(fair.penalty429PerMin))次罚 \(Fmt.num(fair.penaltyMinutes))分")
+                        HStack(spacing: 6) {
+                            ruleCapsule(icon: "bolt.fill", text: "并发: 单Key \(Fmt.num(fair.inflightPerKey)) / 全站 \(Fmt.num(fair.inflightGlobal))")
+                            ruleCapsule(icon: "archivebox.fill", text: "突发桶: \(Fmt.num(fair.burstCapacity)) / 补 \(Fmt.num(fair.burstRefillPerMin))")
+                            ruleCapsule(icon: "shield.fill", text: "超 \(Fmt.num(fair.penalty429PerMin))次 429 罚 \(Fmt.num(fair.penaltyMinutes))分")
                         }
                     }
                 }
             }
 
-            // Row 4: 开发者集成与 API Key 卡片
+            // Row 4: API 与模型
             if let key = o.apiKey, !key.isEmpty {
-                MetricCard(title: "API Key 与模型集成", icon: "terminal.fill", iconColor: .purple) {
-                    VStack(spacing: 8) {
-                        // API Key 行
+                MetricCard(title: "API 与模型", icon: "terminal.fill", iconColor: .purple) {
+                    VStack(spacing: 6) {
                         HStack {
-                            Label("API Key", systemImage: "key.fill")
+                            Text("Key")
                                 .font(.caption.weight(.semibold))
-                                .frame(width: 80, alignment: .leading)
+                                .frame(width: 45, alignment: .leading)
                             Text(masked(key))
                                 .font(.system(.caption, design: .monospaced))
-                                .padding(.horizontal, 8)
-                                .padding(.vertical, 4)
-                                .background(Color.primary.opacity(0.04))
-                                .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
                             Spacer()
-                            Button {
+                            Button(model.copiedKey ? "已复制" : "复制") {
                                 model.copyKey(key)
-                            } label: {
-                                HStack(spacing: 4) {
-                                    Image(systemName: model.copiedKey ? "checkmark" : "doc.on.doc")
-                                    Text(model.copiedKey ? "已复制" : "复制 Key")
-                                }
-                                .font(.caption)
                             }
                             .buttonStyle(.bordered)
+                            .controlSize(.small)
                         }
 
-                        // Base URL 行
                         HStack {
-                            Label("Base URL", systemImage: "link")
+                            Text("URL")
                                 .font(.caption.weight(.semibold))
-                                .frame(width: 80, alignment: .leading)
+                                .frame(width: 45, alignment: .leading)
                             Text("https://monk.party/v1")
                                 .font(.system(.caption, design: .monospaced))
-                                .padding(.horizontal, 8)
-                                .padding(.vertical, 4)
-                                .background(Color.primary.opacity(0.04))
-                                .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
                             Spacer()
-                            Button {
+                            Button(model.copiedBaseURL ? "已复制" : "复制") {
                                 model.copyBaseURL()
-                            } label: {
-                                HStack(spacing: 4) {
-                                    Image(systemName: model.copiedBaseURL ? "checkmark" : "doc.on.doc")
-                                    Text(model.copiedBaseURL ? "已复制" : "复制 URL")
-                                }
-                                .font(.caption)
                             }
                             .buttonStyle(.bordered)
+                            .controlSize(.small)
                         }
 
-                        // 模型支持 Tags
-                        HStack(spacing: 8) {
-                            Text("可用模型:")
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                            modelTag(name: "monk", desc: "质量优先·默认")
-                            modelTag(name: "monk-fast", desc: "极速日常")
-                            modelTag(name: "monk-coding", desc: "编程专用")
+                        HStack(spacing: 6) {
+                            Text("模型:").font(.caption2).foregroundStyle(.secondary)
+                            modelTag(name: "monk", desc: "默认")
+                            modelTag(name: "monk-fast", desc: "极速")
+                            modelTag(name: "monk-coding", desc: "代码")
                             Spacer()
                         }
-                        .padding(.top, 2)
                     }
                 }
             }
         }
     }
 
-    private func ruleCapsule(icon: String, title: String, detail: String) -> some View {
-        HStack(spacing: 5) {
+    private func ruleCapsule(icon: String, text: String) -> some View {
+        HStack(spacing: 4) {
             Image(systemName: icon)
-                .font(.system(size: 9))
+                .font(.system(size: 8))
                 .foregroundStyle(Visuals.flameOrange)
-            VStack(alignment: .leading, spacing: 1) {
-                Text(title)
-                    .font(.system(size: 9, weight: .semibold))
-                    .foregroundStyle(.secondary)
-                Text(detail)
-                    .font(.system(size: 9))
-                    .foregroundStyle(.primary)
-            }
-        }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 4)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(Color.primary.opacity(0.03))
-        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-    }
-
-    private func modelTag(name: String, desc: String) -> some View {
-        HStack(spacing: 3) {
-            Text(name)
-                .font(.system(.caption2, design: .monospaced).weight(.bold))
-            Text("(\(desc))")
+            Text(text)
                 .font(.system(size: 9))
                 .foregroundStyle(.secondary)
         }
         .padding(.horizontal, 6)
-        .padding(.vertical, 2.5)
-        .background(Color.primary.opacity(0.04))
+        .padding(.vertical, 3)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.primary.opacity(0.03))
         .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
     }
 
-    // MARK: - 到期续费引导横幅
-    @ViewBuilder
-    private func renewalBanner(_ o: Order) -> some View {
-        let daysLeft = Fmt.left(o.remainingMs, expired: o.expired == true)
-        HStack(spacing: 14) {
-            Image(systemName: "flame.fill")
-                .font(.system(size: 22))
-                .foregroundStyle(Visuals.flameOrange)
-                .frame(width: 40, height: 40)
-                .background(Visuals.flameOrange.opacity(0.12))
-                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
-
-            VStack(alignment: .leading, spacing: 3) {
-                HStack(spacing: 6) {
-                    Text(o.expired == true ? "Monk 套餐已到期" : "Monk 套餐即将到期")
-                        .font(.system(size: 13, weight: .bold))
-                        .foregroundStyle(Visuals.flameOrange)
-
-                    Text("剩余 \(daysLeft)")
-                        .font(.system(size: 10, weight: .semibold))
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 2)
-                        .background(Visuals.flameOrange.opacity(0.15))
-                        .foregroundStyle(Visuals.flameOrange)
-                        .clipShape(Capsule())
-                }
-
-                Text(o.expired == true
-                    ? "您的月卡权限已到期，无法继续调用。请续订新套餐以立即恢复模型调用服务。"
-                    : "当前套餐有效期不足 3 天（到期时间 \(Fmt.date(o.expiresAt))）。为保证日常开发与 Coding Agent 服务不中断，建议提前续费。")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-            }
-
-            Spacer()
-
-            Button {
-                model.openPricing()
-            } label: {
-                HStack(spacing: 4) {
-                    Text("立即续订新套餐")
-                    Image(systemName: "arrow.up.forward.app")
-                }
-                .font(.caption.weight(.semibold))
-            }
-            .buttonStyle(.borderedProminent)
-            .tint(Visuals.flameOrange)
+    private func modelTag(name: String, desc: String) -> some View {
+        HStack(spacing: 2) {
+            Text(name)
+                .font(.system(.caption2, design: .monospaced).weight(.bold))
+            Text("(\(desc))")
+                .font(.system(size: 8.5))
+                .foregroundStyle(.secondary)
         }
-        .padding(12)
-        .background(Visuals.flameOrange.opacity(0.06))
-        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .stroke(Visuals.flameOrange.opacity(0.35), lineWidth: 1)
-        )
+        .padding(.horizontal, 5)
+        .padding(.vertical, 2)
+        .background(Color.primary.opacity(0.04))
+        .clipShape(RoundedRectangle(cornerRadius: 5, style: .continuous))
     }
 
-    // MARK: - 推荐搭配 Monk-Pi 工具卡片
+    // MARK: - 未配置指引卡片
+    private var unconfiguredCard: some View {
+        VStack(spacing: 8) {
+            Image(systemName: "key.viewfinder")
+                .font(.system(size: 28))
+                .foregroundStyle(Visuals.flameOrange)
+                .padding(.top, 2)
+
+            Text("未配置凭据")
+                .font(.system(size: 13, weight: .bold))
+
+            Text("在下方填写下单邮箱与订单号 (MK...)，点击「保存」同步。")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+
+            Button {
+                NSWorkspace.shared.open(Cfg.accountPage)
+            } label: {
+                Label("前往 monk.party", systemImage: "arrow.up.forward.app")
+            }
+            .buttonStyle(.link)
+            .font(.caption2)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 14)
+        .background(Color(NSColor.controlBackgroundColor))
+        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+    }
+
+    // MARK: - Monk-Pi 推荐卡片
     private var monkPiRecommendationCard: some View {
-        MetricCard(title: "推荐搭配 · Monk × Pi 终端 Coding Agent", icon: "sparkles", iconColor: Visuals.flameOrange, badge: "官方推荐 · 零配置", badgeColor: Visuals.flameOrange) {
-            VStack(alignment: .leading, spacing: 10) {
-                Text("将 Monk 的 OpenAI 兼容融合模型（100 万上下文 / Agent 原生调优）与极速终端 Agent 深度结合。无需手写繁琐配置，预置 `monk-coding` 专属模型优化。")
+        MetricCard(title: "推荐工具 · Monk-Pi", icon: "sparkles", iconColor: Visuals.flameOrange, badge: "终端 Agent", badgeColor: Visuals.flameOrange) {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Pi 终端 Coding Agent 零配置接入，预置 `monk-coding` 专属优化。")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
 
-                HStack(spacing: 10) {
-                    // 命令 1: npx monk-pi
-                    HStack(spacing: 6) {
-                        Text("npx monk-pi")
-                            .font(.system(.caption2, design: .monospaced).weight(.medium))
+                HStack(spacing: 8) {
+                    HStack(spacing: 4) {
+                        Text("npx monk-pi").font(.system(.caption2, design: .monospaced))
                         Spacer()
-                        Button {
+                        Button(model.copiedMonkPiNpx ? "已复制" : "复制") {
                             model.copyMonkPiNpx()
-                        } label: {
-                            HStack(spacing: 3) {
-                                Image(systemName: model.copiedMonkPiNpx ? "checkmark" : "doc.on.doc")
-                                Text(model.copiedMonkPiNpx ? "已复制" : "免安装即跑")
-                            }
-                            .font(.system(size: 10))
                         }
                         .buttonStyle(.borderless)
+                        .font(.system(size: 10))
                         .foregroundStyle(Visuals.flameOrange)
                     }
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 6)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
                     .background(Color.primary.opacity(0.03))
-                    .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+                    .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
 
-                    // 命令 2: brew install yaoleifly/tap/monk-pi
-                    HStack(spacing: 6) {
-                        Text("brew install ...")
-                            .font(.system(.caption2, design: .monospaced).weight(.medium))
+                    HStack(spacing: 4) {
+                        Text("brew install ...").font(.system(.caption2, design: .monospaced))
                         Spacer()
-                        Button {
+                        Button(model.copiedMonkPiBrew ? "已复制" : "复制") {
                             model.copyMonkPiBrew()
-                        } label: {
-                            HStack(spacing: 3) {
-                                Image(systemName: model.copiedMonkPiBrew ? "checkmark" : "doc.on.doc")
-                                Text(model.copiedMonkPiBrew ? "已复制" : "Homebrew")
-                            }
-                            .font(.system(size: 10))
                         }
                         .buttonStyle(.borderless)
+                        .font(.system(size: 10))
                         .foregroundStyle(Visuals.flameOrange)
                     }
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 6)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
                     .background(Color.primary.opacity(0.03))
-                    .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
-                }
+                    .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
 
-                HStack {
                     Spacer()
+
                     Button {
                         model.openMonkPiGitHub()
                     } label: {
-                        HStack(spacing: 4) {
-                            Text("在 GitHub 查看 yaoleifly/monk-pi")
-                            Image(systemName: "arrow.up.forward.app")
-                        }
-                        .font(.caption2.weight(.medium))
+                        Text("GitHub ↗").font(.caption2)
                     }
                     .buttonStyle(.link)
                 }
@@ -1554,139 +1676,50 @@ struct SettingsView: View {
         }
     }
 
-    // MARK: - 未配置指引卡片
-    private var unconfiguredCard: some View {
-        VStack(spacing: 12) {
-            Image(systemName: "key.viewfinder")
-                .font(.system(size: 38))
-                .foregroundStyle(Visuals.flameOrange)
-                .padding(.top, 8)
-
-            Text("尚未连接 Monk 账户")
-                .font(.system(size: 15, weight: .bold))
-
-            Text("请在下方输入你下单时填写的邮箱与订单号（形如 MK...），点击「保存并刷新」，即可自动调取实时内部计量、健康度与 API Key。")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-                .padding(.horizontal, 30)
-
-            Button {
-                NSWorkspace.shared.open(Cfg.accountPage)
-            } label: {
-                Label("前往 monk.party 官网查看或购买", systemImage: "arrow.up.forward.app")
-            }
-            .buttonStyle(.link)
-            .font(.caption.weight(.medium))
-            .padding(.bottom, 6)
-        }
-        .frame(maxWidth: .infinity)
-        .padding(.vertical, 20)
-        .background(Color(NSColor.controlBackgroundColor))
-        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: 12, style: .continuous)
-                .stroke(Color.primary.opacity(0.06), lineWidth: 1)
-        )
-    }
-
-    // MARK: - 账号凭据配置卡片
+    // MARK: - 账号凭据卡片
     private var credentialsCard: some View {
-        MetricCard(title: "账号凭据设置", icon: "person.crop.circle.badge.checkmark", iconColor: .primary) {
-            VStack(spacing: 12) {
-                // 下单邮箱
-                HStack(spacing: 8) {
-                    Label("下单邮箱", systemImage: "envelope")
-                        .font(.caption.weight(.semibold))
-                        .frame(width: 80, alignment: .leading)
-                    TextField("如 your@email.com", text: $model.email)
-                        .textFieldStyle(.roundedBorder)
-
+        MetricCard(title: "账号凭据", icon: "person.crop.circle", iconColor: .primary) {
+            VStack(spacing: 8) {
+                HStack(spacing: 6) {
+                    Text("邮箱").font(.caption.weight(.medium)).frame(width: 45, alignment: .leading)
+                    TextField("your@email.com", text: $model.email).textFieldStyle(.roundedBorder)
                     if !model.email.isEmpty {
-                        Button {
-                            model.copyEmail()
-                        } label: {
-                            Image(systemName: model.copiedEmail ? "checkmark" : "doc.on.doc")
-                                .font(.caption2)
-                        }
-                        .buttonStyle(.bordered)
-                        .help("复制邮箱 (⌘C)")
+                        Button(model.copiedEmail ? "已复制" : "复制") { model.copyEmail() }
+                            .buttonStyle(.bordered).controlSize(.small)
                     }
-
-                    Button {
-                        model.pasteEmail()
-                    } label: {
-                        HStack(spacing: 3) {
-                            Image(systemName: "doc.on.clipboard")
-                            Text("粘贴")
-                        }
-                        .font(.caption2)
-                    }
-                    .buttonStyle(.bordered)
-                    .help("从剪贴板粘贴 (⌘V)")
+                    Button("粘贴") { model.pasteEmail() }
+                        .buttonStyle(.bordered).controlSize(.small)
                 }
 
-                // 订单号
-                HStack(spacing: 8) {
-                    Label("订单号", systemImage: "number")
-                        .font(.caption.weight(.semibold))
-                        .frame(width: 80, alignment: .leading)
-                    TextField("形如 MK...", text: $model.tradeNo)
-                        .textFieldStyle(.roundedBorder)
-                        .font(.system(.body, design: .monospaced))
-
+                HStack(spacing: 6) {
+                    Text("订单号").font(.caption.weight(.medium)).frame(width: 45, alignment: .leading)
+                    TextField("MK...", text: $model.tradeNo).textFieldStyle(.roundedBorder).font(.system(.body, design: .monospaced))
                     if !model.tradeNo.isEmpty {
-                        Button {
-                            model.copyTradeNo()
-                        } label: {
-                            Image(systemName: model.copiedTradeNo ? "checkmark" : "doc.on.doc")
-                                .font(.caption2)
-                        }
-                        .buttonStyle(.bordered)
-                        .help("复制订单号 (⌘C)")
+                        Button(model.copiedTradeNo ? "已复制" : "复制") { model.copyTradeNo() }
+                            .buttonStyle(.bordered).controlSize(.small)
                     }
-
-                    Button {
-                        model.pasteTradeNo()
-                    } label: {
-                        HStack(spacing: 3) {
-                            Image(systemName: "doc.on.clipboard")
-                            Text("粘贴")
-                        }
-                        .font(.caption2)
-                    }
-                    .buttonStyle(.bordered)
-                    .help("从剪贴板粘贴 (⌘V)")
+                    Button("粘贴") { model.pasteTradeNo() }
+                        .buttonStyle(.bordered).controlSize(.small)
                 }
 
-                if let err = model.validationError {
-                    HStack(spacing: 5) {
-                        Image(systemName: "exclamationmark.triangle.fill")
-                        Text(err)
-                        Spacer()
+                HStack {
+                    if let err = model.validationError {
+                        Text(err).font(.caption2).foregroundStyle(.red)
+                    } else {
+                        Text("凭据仅存本机，支持 ⌘C / ⌘V。").font(.caption2).foregroundStyle(.secondary)
                     }
-                    .font(.caption)
-                    .foregroundStyle(.red)
-                } else {
-                    HStack(spacing: 5) {
-                        Image(systemName: "lock.shield")
-                        Text("原生支持 ⌘C 复制与 ⌘V 粘贴。凭据仅保存在本机 Application Support，绝不上报第三方。")
-                        Spacer()
-                    }
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
+                    Spacer()
                 }
             }
         }
     }
 
-    // MARK: - 通用偏好卡片
+    // MARK: - 偏好设置卡片
     private var preferencesCard: some View {
-        MetricCard(title: "偏好与轮询", icon: "gearshape", iconColor: .secondary) {
-            VStack(alignment: .leading, spacing: 10) {
+        MetricCard(title: "偏好设置", icon: "gearshape", iconColor: .secondary) {
+            VStack(alignment: .leading, spacing: 8) {
                 HStack {
-                    Text("状态栏显示样式")
-                        .font(.caption.weight(.medium))
+                    Text("显示样式").font(.caption.weight(.medium))
                     Spacer()
                     Picker("", selection: $model.statusDisplayMode) {
                         ForEach(StatusDisplayMode.allCases, id: \.self) { mode in
@@ -1695,74 +1728,71 @@ struct SettingsView: View {
                     }
                     .pickerStyle(.menu)
                     .labelsHidden()
-                    .frame(width: 250)
+                    .frame(width: 200)
                 }
 
                 Divider()
 
-                Toggle("开启后台自动刷新 (5分钟安全间隔)", isOn: $model.autoRefresh)
-                    .font(.caption.weight(.medium))
+                Toggle("后台自动刷新 (5分钟)", isOn: $model.autoRefresh)
+                    .font(.caption)
 
-                Text("根据 monk.party 官方说明，「一次查询计算一次今日用量」，为保护您的每日额度，轮询间隔已锁定为 5 分钟安全下限。日常建议手动按 ⌘R 刷新。")
+                Toggle("启动时自动检查更新", isOn: $model.autoCheckUpdates)
+                    .font(.caption)
+                    .onChange(of: model.autoCheckUpdates) { val in
+                        model.agent?.setAutoCheckUpdates(val)
+                    }
+
+                HStack {
+                    Text("版本: v\(UpdateChecker.currentVersion)")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+
+                    if let note = model.updateResultNote {
+                        Text(note).font(.caption2.weight(.medium)).foregroundStyle(.green)
+                    }
+
+                    Spacer()
+
+                    Button(model.checkingUpdate ? "检查中…" : "检查更新") {
+                        model.checkUpdateManual()
+                    }
                     .font(.caption2)
-                    .foregroundStyle(.secondary)
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(model.checkingUpdate)
+                }
             }
         }
     }
 
     // MARK: - 底部操作栏
     private var bottomActionBar: some View {
-        HStack(spacing: 14) {
-            Button {
-                NSWorkspace.shared.open(Cfg.accountPage)
-            } label: {
-                Label("官方网站", systemImage: "safari")
-            }
-            .buttonStyle(.link)
-            .font(.callout)
+        HStack(spacing: 12) {
+            Button("官网 ↗") { NSWorkspace.shared.open(Cfg.accountPage) }
+                .buttonStyle(.link).font(.caption)
 
-            Button {
-                model.openCharter()
-            } label: {
-                Label("使用倡议书", systemImage: "scroll")
-            }
-            .buttonStyle(.link)
-            .font(.callout)
+            Button("使用倡议书 ↗") { model.openCharter() }
+                .buttonStyle(.link).font(.caption)
 
-            Button {
-                NSWorkspace.shared.open(Cfg.url)
-            } label: {
-                Label("打开配置文件", systemImage: "doc.text")
-            }
-            .buttonStyle(.link)
-            .font(.callout)
+            Button("配置文件") { NSWorkspace.shared.open(Cfg.url) }
+                .buttonStyle(.link).font(.caption)
 
             Spacer()
 
             if model.saveSuccess {
-                HStack(spacing: 4) {
-                    Image(systemName: "checkmark.circle.fill")
-                    Text("已保存并刷新")
-                }
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.green)
-                .transition(.opacity)
+                Text("已保存").font(.caption.weight(.semibold)).foregroundStyle(.green)
             }
 
-            Button("关闭") {
-                onClose()
-            }
-            .keyboardShortcut(.cancelAction)
+            Button("关闭") { onClose() }
+                .keyboardShortcut(.cancelAction)
 
-            Button("保存并刷新") {
-                model.saveAndRefresh()
-            }
-            .keyboardShortcut(.defaultAction)
-            .buttonStyle(.borderedProminent)
-            .tint(Visuals.flameOrange)
+            Button("保存") { model.saveAndRefresh() }
+                .keyboardShortcut(.defaultAction)
+                .buttonStyle(.borderedProminent)
+                .tint(Visuals.flameOrange)
         }
-        .padding(.horizontal, 20)
-        .padding(.vertical, 14)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
         .background(Color(NSColor.windowBackgroundColor))
     }
 
@@ -1794,13 +1824,13 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
             }
             let host = NSHostingView(rootView: view)
             let win = NSWindow(
-                contentRect: NSRect(x: 0, y: 0, width: 560, height: 660),
+                contentRect: NSRect(x: 0, y: 0, width: 530, height: 620),
                 styleMask: [.titled, .closable, .miniaturizable, .resizable],
                 backing: .buffered,
                 defer: false
             )
             win.title = "Monk 设置"
-            win.minSize = NSSize(width: 520, height: 580)
+            win.minSize = NSSize(width: 480, height: 540)
             win.contentView = host
             win.isReleasedWhenClosed = false
             win.delegate = self
@@ -1817,6 +1847,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         window?.makeKeyAndOrderFront(nil)
     }
 }
+
 
 // MARK: - CLI
 
