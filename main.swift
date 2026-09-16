@@ -97,6 +97,7 @@ struct Config: Codable {
 enum Cfg {
     static let endpoint = URL(string: "https://monk.party/monk-api/lookup-order")!
     static let accountPage = URL(string: "https://monk.party/account/")!
+    static let charterPage = URL(string: "https://monk.party/charter/")!
 
     static var dir: URL {
         let fm = FileManager.default
@@ -463,6 +464,7 @@ final class Agent: NSObject, NSMenuDelegate {
 
     func start() {
         NSApp.setActivationPolicy(.accessory)
+        setupMainMenu()
         displayMode = StatusDisplayMode(rawValue: UserDefaults.standard.string(forKey: "monkStatusDisplayMode") ?? "") ?? .detailed
         item.autosaveName = "party.monk.usage.statusItem"
         item.button?.image = Visuals.makeMenuIcon()
@@ -475,6 +477,23 @@ final class Agent: NSObject, NSMenuDelegate {
         if Cfg.load() == nil {
             DispatchQueue.main.async { [weak self] in self?.doSettings() }
         }
+    }
+
+    /// 在 Accessory 模式下注册系统级 Edit 菜单，激活 ⌘C / ⌘V / ⌘X / ⌘A / ⌘Z 原生快捷键
+    private func setupMainMenu() {
+        let mainMenu = NSMenu()
+        let editMenuItem = NSMenuItem()
+        let editMenu = NSMenu(title: "Edit")
+        editMenu.addItem(withTitle: "撤销", action: #selector(UndoManager.undo), keyEquivalent: "z")
+        editMenu.addItem(withTitle: "重做", action: #selector(UndoManager.redo), keyEquivalent: "Z")
+        editMenu.addItem(.separator())
+        editMenu.addItem(withTitle: "剪切", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        editMenu.addItem(withTitle: "复制", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        editMenu.addItem(withTitle: "粘贴", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        editMenu.addItem(withTitle: "全选", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        editMenuItem.submenu = editMenu
+        mainMenu.addItem(editMenuItem)
+        NSApp.mainMenu = mainMenu
     }
 
     func setAttributedTitle(_ attr: NSAttributedString, tip: String) {
@@ -589,6 +608,11 @@ final class Agent: NSObject, NSMenuDelegate {
         monkPiItem.target = self
         menu.addItem(monkPiItem)
 
+        // 官方使用倡议书
+        let charterItem = NSMenuItem(title: "📜 Monk 使用倡议书 ↗", action: #selector(doCharter), keyEquivalent: "")
+        charterItem.target = self
+        menu.addItem(charterItem)
+
         let conf = NSMenuItem(title: "设置账号…", action: #selector(doSettings), keyEquivalent: ",")
         conf.target = self
         menu.addItem(conf)
@@ -650,6 +674,10 @@ final class Agent: NSObject, NSMenuDelegate {
 
     @objc func doOpenPricing() {
         NSWorkspace.shared.open(URL(string: "https://monk.party/")!)
+    }
+
+    @objc func doCharter() {
+        NSWorkspace.shared.open(Cfg.charterPage)
     }
 
     @objc func doOpenMonkPi() {
@@ -732,6 +760,43 @@ final class SettingsViewModel: ObservableObject {
         self.copiedBaseURL = false
     }
 
+    @Published var copiedEmail: Bool = false
+    @Published var copiedTradeNo: Bool = false
+
+    func copyEmail() {
+        guard !email.isEmpty else { return }
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.setString(email, forType: .string)
+        withAnimation(.easeInOut(duration: 0.2)) { copiedEmail = true }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+            withAnimation { self?.copiedEmail = false }
+        }
+    }
+
+    func pasteEmail() {
+        if let s = NSPasteboard.general.string(forType: .string)?.trimmingCharacters(in: .whitespacesAndNewlines), !s.isEmpty {
+            self.email = s
+        }
+    }
+
+    func copyTradeNo() {
+        guard !tradeNo.isEmpty else { return }
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.setString(tradeNo, forType: .string)
+        withAnimation(.easeInOut(duration: 0.2)) { copiedTradeNo = true }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+            withAnimation { self?.copiedTradeNo = false }
+        }
+    }
+
+    func pasteTradeNo() {
+        if let s = NSPasteboard.general.string(forType: .string)?.trimmingCharacters(in: .whitespacesAndNewlines), !s.isEmpty {
+            self.tradeNo = s
+        }
+    }
+
     func copyKey(_ key: String) {
         let pb = NSPasteboard.general
         pb.clearContents()
@@ -781,6 +846,10 @@ final class SettingsViewModel: ObservableObject {
 
     func openPricing() {
         NSWorkspace.shared.open(URL(string: "https://monk.party/")!)
+    }
+
+    func openCharter() {
+        NSWorkspace.shared.open(Cfg.charterPage)
     }
 
     func refreshNow() {
@@ -1524,22 +1593,70 @@ struct SettingsView: View {
     // MARK: - 账号凭据配置卡片
     private var credentialsCard: some View {
         MetricCard(title: "账号凭据设置", icon: "person.crop.circle.badge.checkmark", iconColor: .primary) {
-            VStack(spacing: 10) {
-                HStack {
+            VStack(spacing: 12) {
+                // 下单邮箱
+                HStack(spacing: 8) {
                     Label("下单邮箱", systemImage: "envelope")
                         .font(.caption.weight(.semibold))
                         .frame(width: 80, alignment: .leading)
                     TextField("如 your@email.com", text: $model.email)
                         .textFieldStyle(.roundedBorder)
+
+                    if !model.email.isEmpty {
+                        Button {
+                            model.copyEmail()
+                        } label: {
+                            Image(systemName: model.copiedEmail ? "checkmark" : "doc.on.doc")
+                                .font(.caption2)
+                        }
+                        .buttonStyle(.bordered)
+                        .help("复制邮箱 (⌘C)")
+                    }
+
+                    Button {
+                        model.pasteEmail()
+                    } label: {
+                        HStack(spacing: 3) {
+                            Image(systemName: "doc.on.clipboard")
+                            Text("粘贴")
+                        }
+                        .font(.caption2)
+                    }
+                    .buttonStyle(.bordered)
+                    .help("从剪贴板粘贴 (⌘V)")
                 }
 
-                HStack {
+                // 订单号
+                HStack(spacing: 8) {
                     Label("订单号", systemImage: "number")
                         .font(.caption.weight(.semibold))
                         .frame(width: 80, alignment: .leading)
                     TextField("形如 MK...", text: $model.tradeNo)
                         .textFieldStyle(.roundedBorder)
                         .font(.system(.body, design: .monospaced))
+
+                    if !model.tradeNo.isEmpty {
+                        Button {
+                            model.copyTradeNo()
+                        } label: {
+                            Image(systemName: model.copiedTradeNo ? "checkmark" : "doc.on.doc")
+                                .font(.caption2)
+                        }
+                        .buttonStyle(.bordered)
+                        .help("复制订单号 (⌘C)")
+                    }
+
+                    Button {
+                        model.pasteTradeNo()
+                    } label: {
+                        HStack(spacing: 3) {
+                            Image(systemName: "doc.on.clipboard")
+                            Text("粘贴")
+                        }
+                        .font(.caption2)
+                    }
+                    .buttonStyle(.bordered)
+                    .help("从剪贴板粘贴 (⌘V)")
                 }
 
                 if let err = model.validationError {
@@ -1553,7 +1670,7 @@ struct SettingsView: View {
                 } else {
                     HStack(spacing: 5) {
                         Image(systemName: "lock.shield")
-                        Text("凭据仅保存在本机 Application Support，绝不上报第三方。")
+                        Text("原生支持 ⌘C 复制与 ⌘V 粘贴。凭据仅保存在本机 Application Support，绝不上报第三方。")
                         Spacer()
                     }
                     .font(.caption2)
@@ -1600,6 +1717,14 @@ struct SettingsView: View {
                 NSWorkspace.shared.open(Cfg.accountPage)
             } label: {
                 Label("官方网站", systemImage: "safari")
+            }
+            .buttonStyle(.link)
+            .font(.callout)
+
+            Button {
+                model.openCharter()
+            } label: {
+                Label("使用倡议书", systemImage: "scroll")
             }
             .buttonStyle(.link)
             .font(.callout)
