@@ -211,11 +211,17 @@ enum UpdateChecker {
 
 // MARK: - 接口模型
 
-struct UsageWindow: Codable { var w: Double?; var pin: Double? }
+struct UsageWindow: Codable {
+    var n: Double?
+    var w: Double?
+    var pin: Double?
+}
 
 struct RateLimit: Codable {
     var limited: Bool?
+    var reason: String?
     var retryAt: String?
+    var retryAfter: Double?
     var hour: UsageWindow?
     var six: UsageWindow?
 }
@@ -239,6 +245,9 @@ struct Order: Codable {
     var apiKey: String?
     var tradeNo: String?
     var status: String?
+    var money: String?
+    var baseUrl: String?
+    var model: String?
     var createdAt: String?
     var paidAt: String?
     var expiresAt: String?
@@ -248,6 +257,7 @@ struct Order: Codable {
     var keyActive: Bool?
     var dailyCost: Double?
     var dailyLimit: Double?
+    var dailyReset: String?
     var tokens: Tokens?
     var fairness: Fairness?
     var rateLimit: RateLimit?
@@ -387,12 +397,49 @@ enum Fmt {
 func state(_ o: Order) -> (label: String, bad: Bool) {
     let expired = o.expired == true || o.keyActive == false
     if expired { return ("已停用", true) }
+
+    // 1. 冷却中
     if let cd = Fmt.parse(o.cooldownUntil), cd.timeIntervalSinceNow > 0 {
         return ("冷却中 · " + Fmt.rel(o.cooldownUntil) + "解除", true)
     }
+
+    // 2. 持续限流中 (带原因)
     if o.rateLimit?.limited == true {
-        return ("限流中 · " + Fmt.rel(o.rateLimit?.retryAt) + "恢复", true)
+        let until = o.rateLimit?.retryAt != nil ? Fmt.rel(o.rateLimit?.retryAt) + "恢复" : "请降并发"
+        let reason = o.rateLimit?.reason != nil ? " (\(o.rateLimit!.reason!))" : ""
+        return ("限流中 · \(until)\(reason)", true)
     }
+
+    // 3. Retry-After 临时退避
+    if let retry = o.rateLimit?.retryAfter, retry > 0 {
+        return ("限流中 · \(Int(retry))s 后重试", true)
+    }
+
+    // 4. 今日保险丝打满
+    if let limit = o.dailyLimit, limit > 0, (o.dailyCost ?? 0) >= limit {
+        return ("今日熔断 · UTC 00:00 清零", true)
+    }
+
+    // 5. 1小时窗口达到上限
+    if let r = o.rateLimit?.hour, let f = o.fairness {
+        if let w = r.w, let maxW = f.hourMax, maxW > 0, w >= maxW {
+            return ("1h 次数超限", true)
+        }
+        if let pin = r.pin, let maxPin = f.hourPrompt, maxPin > 0, pin >= maxPin {
+            return ("1h Token 超限", true)
+        }
+    }
+
+    // 6. 6小时窗口达到上限
+    if let r = o.rateLimit?.six, let f = o.fairness {
+        if let w = r.w, let maxW = f.sixHourMax, maxW > 0, w >= maxW {
+            return ("6h 次数超限", true)
+        }
+        if let pin = r.pin, let maxPin = f.sixHourPrompt, maxPin > 0, pin >= maxPin {
+            return ("6h Token 超限", true)
+        }
+    }
+
     return ("可调用", false)
 }
 
@@ -584,16 +631,21 @@ final class Agent: NSObject, NSMenuDelegate {
 
     func refreshIfNeeded() {
         guard let cfg = Cfg.load() else {
-            order = nil
-            note = "未配置：点击下方「设置账号…」填邮箱与订单号"
-            render()
+            setOrder(nil, note: "未配置：点击下方「设置…」填邮箱与订单号")
             return
         }
         fetcher.lookup(cfg) { [weak self] o, e in
             guard let self else { return }
-            self.order = o ?? self.order
-            self.note = e
-            self.render()
+            self.setOrder(o ?? self.order, note: e)
+        }
+    }
+
+    func setOrder(_ o: Order?, note: String?) {
+        self.order = o
+        self.note = note
+        self.render()
+        DispatchQueue.main.async {
+            SettingsWindowController.shared.updateOrder(o, note: note)
         }
     }
 
@@ -882,6 +934,9 @@ final class Agent: NSObject, NSMenuDelegate {
 // MARK: - 精简高效设置面板与实时看板 (SwiftUI + AppKit)
 
 final class SettingsViewModel: ObservableObject {
+    @Published var order: Order? = nil
+    @Published var pingStatus: String? = nil
+    @Published var isPinging: Bool = false
     @Published var email: String = ""
     @Published var tradeNo: String = ""
     @Published var autoRefresh: Bool = false
@@ -903,6 +958,7 @@ final class SettingsViewModel: ObservableObject {
 
     func loadFromCurrent(agent: Agent) {
         self.agent = agent
+        self.order = agent.order
         let cfg = Cfg.load()
         self.email = cfg?.email ?? ""
         self.tradeNo = cfg?.tradeNo ?? ""
@@ -1026,6 +1082,64 @@ final class SettingsViewModel: ObservableObject {
                 }
             }
         }
+    }
+
+    func pingModel() {
+        guard let key = order?.apiKey ?? agent?.order?.apiKey, !key.isEmpty else {
+            pingStatus = "⚠️ 未获取到有效 API Key"
+            return
+        }
+        isPinging = true
+        pingStatus = "正在测试调用 monk-fast…"
+
+        let start = Date()
+        var req = URLRequest(url: URL(string: "https://monk.party/v1/chat/completions")!)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+        req.timeoutInterval = 10
+        let payload: [String: Any] = [
+            "model": "monk-fast",
+            "messages": [["role": "user", "content": "hi"]],
+            "max_tokens": 5
+        ]
+        req.httpBody = try? JSONSerialization.data(withJSONObject: payload)
+
+        URLSession.shared.dataTask(with: req) { [weak self] data, resp, err in
+            let ms = Int(Date().timeIntervalSince(start) * 1000)
+            DispatchQueue.main.async {
+                self?.isPinging = false
+                if let err = err {
+                    self?.pingStatus = "❌ 网络错误: \(err.localizedDescription)"
+                    return
+                }
+                guard let http = resp as? HTTPURLResponse else {
+                    self?.pingStatus = "❌ 响应异常"
+                    return
+                }
+
+                if http.statusCode == 200 {
+                    self?.pingStatus = "✅ 响应正常 (\(ms)ms) · 未被限流"
+                    self?.agent?.refreshIfNeeded()
+                } else if http.statusCode == 429 {
+                    var detail = "429 限流中"
+                    if let data = data,
+                       let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                        if let msg = (json["error"] as? [String: Any])?["message"] as? String {
+                            detail = msg
+                        } else if let msg = json["error"] as? String {
+                            detail = msg
+                        } else if let msg = json["message"] as? String {
+                            detail = msg
+                        }
+                    }
+                    self?.pingStatus = "⚠️ 429 限流: \(detail)"
+                    self?.agent?.refreshIfNeeded()
+                } else {
+                    self?.pingStatus = "HTTP \(http.statusCode)"
+                }
+            }
+        }.resume()
     }
 
     func saveAndRefresh() {
@@ -1244,7 +1358,7 @@ struct SettingsView: View {
                         updateBanner(u)
                     }
 
-                    if let o = model.agent?.order {
+                    if let o = model.order {
                         // 临期提醒
                         if isExpiringSoon(o) {
                             renewalBanner(o)
@@ -1326,7 +1440,7 @@ struct SettingsView: View {
 
     @ViewBuilder
     private var statusBadge: some View {
-        if let o = model.agent?.order {
+        if let o = model.order {
             let st = state(o)
             Text(st.label)
                 .font(.system(size: 10, weight: .semibold))
@@ -1557,6 +1671,32 @@ struct SettingsView: View {
                             modelTag(name: "monk", desc: "默认")
                             modelTag(name: "monk-fast", desc: "极速")
                             modelTag(name: "monk-coding", desc: "代码")
+                            Spacer()
+                        }
+
+                        Divider().padding(.vertical, 2)
+
+                        HStack(spacing: 8) {
+                            Button {
+                                model.pingModel()
+                            } label: {
+                                HStack(spacing: 4) {
+                                    if model.isPinging {
+                                        ProgressView().controlSize(.small)
+                                    }
+                                    Text(model.isPinging ? "测试中…" : "测试连通性 (Ping)")
+                                }
+                                .font(.caption2)
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                            .disabled(model.isPinging)
+
+                            if let status = model.pingStatus {
+                                Text(status)
+                                    .font(.caption2)
+                                    .foregroundStyle(status.contains("✅") ? .green : .red)
+                            }
                             Spacer()
                         }
                     }
@@ -1814,6 +1954,15 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
     static let shared = SettingsWindowController()
     private var window: NSWindow?
     private var model = SettingsViewModel()
+
+    func updateOrder(_ o: Order?, note: String?) {
+        model.order = o
+        model.isRefreshing = false
+        if o != nil {
+            model.email = Cfg.load()?.email ?? model.email
+            model.tradeNo = Cfg.load()?.tradeNo ?? model.tradeNo
+        }
+    }
 
     func show(agent: Agent) {
         model.loadFromCurrent(agent: agent)

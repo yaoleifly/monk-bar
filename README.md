@@ -26,7 +26,7 @@
 ## 下载与运行
 
 ### 直接下载
-前往 **[Releases 页面](https://github.com/yaoleifly/monk-bar/releases)** 下载最新的 `.zip` 包，解压后拖入 `/Applications` 即可。
+前往 **[Releases 页面](https://github.com/yaoleifly/monk-bar/releases)** 下载最新的 `MonkUsage-v1.4.1-macOS-Tahoe-Universal.zip`，解压后拖入 `/Applications` 即可。
 
 ### 本地编译
 
