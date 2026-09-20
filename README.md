@@ -13,20 +13,22 @@
 
 ## 特性一览
 
-1. **状态栏三档显示**：详细（`¥0.40 (1%) · 12d`）、紧凑（`¥0.40`）、仅图标（极简）。
-2. **Bento 看板**：今日内部计量熔断条、有效期倒计时、Token 消耗拆解、1h/6h 双窗口防 429 仪表。
-3. **临期智能预警**：有效期不足 3 天或已到期时自动提示，置顶续费入口。
-4. **原生剪贴板**：输入框全开 `⌘C` / `⌘V` / `⌘A`，自带一键复制与粘贴按钮。
-5. **推荐生态**：内置 [Monk-Pi](https://github.com/yaoleifly/monk-pi) 终端 Coding Agent 免安装与 brew 一键命令。
-6. **自动检查更新**：启动时自动比对 GitHub Release，支持手动检查，可自由开启/关闭。
-7. **macOS Tahoe 原生**：Universal 2 双架构（Apple Silicon + Intel），支持 `⌘-Drag` 拖拽状态栏图标。
+1. **纯邮箱即查 & 多卡切换**：全面适配官方最新协议，仅填下单邮箱即可查询；名下若有多张套餐卡，自动识别并在看板顶部提供胶囊一键切换。
+2. **状态栏三档显示**：详细（`¥0.00 (0%) · 25d`）、紧凑（`¥0.00`）、仅图标（极简）。
+3. **Bento 看板**：今日内部计量熔断条、有效期倒计时、Token 消耗拆解、1h/6h 双窗口防 429 仪表。
+4. **实时连通性诊断 (Ping)**：一键直连探测 `monk-fast`，毫秒级诊断网络延迟与 429 拦截详情。
+5. **临期智能预警**：有效期不足 3 天或已到期时自动提示，置顶续费入口。
+6. **原生剪贴板**：输入框全开 `⌘C` / `⌘V` / `⌘A`，自带一键复制与粘贴按钮。
+7. **推荐生态**：内置 [Monk-Pi](https://github.com/yaoleifly/monk-pi) 终端 Coding Agent 免安装与 brew 一键命令。
+8. **自动检查更新**：启动时自动比对 GitHub Release，支持手动检查，可自由开启/关闭。
+9. **macOS Tahoe 原生**：Universal 2 双架构（Apple Silicon + Intel），支持 `⌘-Drag` 拖拽状态栏图标。
 
 ---
 
 ## 下载与运行
 
 ### 直接下载
-前往 **[Releases 页面](https://github.com/yaoleifly/monk-bar/releases)** 下载最新的 `MonkUsage-v1.4.1-macOS-Tahoe-Universal.zip`，解压后拖入 `/Applications` 即可。
+前往 **[Releases 页面](https://github.com/yaoleifly/monk-bar/releases)** 下载最新的 `MonkUsage-v1.5.0-macOS-Tahoe-Universal.zip`，解压后拖入 `/Applications` 即可。
 
 ### 本地编译
 
@@ -53,7 +55,7 @@ open build/MonkUsage.app
 ## 隐私与存储
 
 - 凭据仅存储在本机沙盒：`~/Library/Application Support/MonkUsage/config.json`，绝不上报。
-- 环境变量注入：`MONK_EMAIL="your@email.com" MONK_TRADENO="MK..."`。
+- 环境变量注入：`MONK_EMAIL="your@email.com"`。
 - 官方规定每次查询计算一次用量，本工具默认手动刷新（`⌘R`），后台轮询安全下限为 5 分钟，具备 ETag 304 缓存。
 
 ---

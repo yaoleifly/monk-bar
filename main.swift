@@ -91,7 +91,7 @@ enum Visuals {
 
 struct Config: Codable {
     var email: String
-    var tradeNo: String
+    var tradeNo: String?
 }
 
 enum Cfg {
@@ -110,16 +110,17 @@ enum Cfg {
 
     static var url: URL { dir.appendingPathComponent("config.json") }
 
-    static let template = "{\n  \"email\": \"you@example.com\",\n  \"tradeNo\": \"MK...\"\n}\n"
+    static let template = "{\n  \"email\": \"you@example.com\"\n}\n"
 
     static func load() -> Config? {
         let env = ProcessInfo.processInfo.environment
-        if let e = env["MONK_EMAIL"], let t = env["MONK_TRADENO"], !e.isEmpty, !t.isEmpty {
-            return Config(email: e, tradeNo: t)
+        if let e = env["MONK_EMAIL"], !e.isEmpty {
+            let t = env["MONK_TRADENO"]
+            return Config(email: e, tradeNo: (t?.isEmpty == false) ? t : nil)
         }
         guard let data = try? Data(contentsOf: url),
               let c = try? JSONDecoder().decode(Config.self, from: data),
-              !c.email.isEmpty, !c.tradeNo.isEmpty, !c.email.contains("example.com")
+              !c.email.isEmpty, c.email.contains("@"), !c.email.contains("example.com")
         else { return nil }
         return c
     }
@@ -224,6 +225,15 @@ struct RateLimit: Codable {
     var retryAfter: Double?
     var hour: UsageWindow?
     var six: UsageWindow?
+
+    init(limited: Bool? = nil, reason: String? = nil, retryAt: String? = nil, retryAfter: Double? = nil, hour: UsageWindow? = nil, six: UsageWindow? = nil) {
+        self.limited = limited
+        self.reason = reason
+        self.retryAt = retryAt
+        self.retryAfter = retryAfter
+        self.hour = hour
+        self.six = six
+    }
 }
 
 struct Fairness: Codable {
@@ -241,8 +251,23 @@ struct Fairness: Codable {
 
 struct Tokens: Codable { var prompt: Double?; var completion: Double?; var total: Double? }
 
+struct KeyItem: Codable, Identifiable {
+    var id: String { tradeNo ?? UUID().uuidString }
+    var tradeNo: String?
+    var apiKeyMasked: String?
+    var paidAt: String?
+    var createdAt: String?
+    var expiresAt: String?
+    var expired: Bool?
+    var keyActive: Bool?
+    var remainingMs: Double?
+    var soon: Bool?
+    var latest: Bool?
+}
+
 struct Order: Codable {
     var apiKey: String?
+    var apiKeyMasked: String?
     var tradeNo: String?
     var status: String?
     var money: String?
@@ -262,9 +287,40 @@ struct Order: Codable {
     var fairness: Fairness?
     var rateLimit: RateLimit?
     var cooldownUntil: String?
+
+    var displayKey: String { apiKeyMasked ?? apiKey ?? "sk-monk-••••" }
+
+    init(apiKey: String? = nil, apiKeyMasked: String? = nil, tradeNo: String? = nil, status: String? = nil, money: String? = nil, baseUrl: String? = nil, model: String? = nil, createdAt: String? = nil, paidAt: String? = nil, expiresAt: String? = nil, remainingMs: Double? = nil, expired: Bool? = nil, soon: Bool? = nil, keyActive: Bool? = nil, dailyCost: Double? = nil, dailyLimit: Double? = nil, dailyReset: String? = nil, tokens: Tokens? = nil, fairness: Fairness? = nil, rateLimit: RateLimit? = nil, cooldownUntil: String? = nil) {
+        self.apiKey = apiKey
+        self.apiKeyMasked = apiKeyMasked
+        self.tradeNo = tradeNo
+        self.status = status
+        self.money = money
+        self.baseUrl = baseUrl
+        self.model = model
+        self.createdAt = createdAt
+        self.paidAt = paidAt
+        self.expiresAt = expiresAt
+        self.remainingMs = remainingMs
+        self.expired = expired
+        self.soon = soon
+        self.keyActive = keyActive
+        self.dailyCost = dailyCost
+        self.dailyLimit = dailyLimit
+        self.dailyReset = dailyReset
+        self.tokens = tokens
+        self.fairness = fairness
+        self.rateLimit = rateLimit
+        self.cooldownUntil = cooldownUntil
+    }
 }
 
-struct Root: Codable { var success: Bool?; var order: Order?; var error: String? }
+struct Root: Codable {
+    var success: Bool?
+    var keys: [KeyItem]?
+    var order: Order?
+    var error: String?
+}
 
 // MARK: - 网络
 
@@ -280,45 +336,53 @@ final class Fetcher {
     }()
 
     /// completion 固定在主线程回调，参数为 (Order?, 用户可读错误?)
-    func lookup(_ cfg: Config, completion: @escaping (Order?, String?) -> Void) {
+    func lookup(_ cfg: Config, completion: @escaping (Order?, [KeyItem]?, String?) -> Void) {
         var req = URLRequest(url: Cfg.endpoint)
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.httpBody = try? JSONSerialization.data(withJSONObject:
-            ["email": cfg.email, "tradeNo": cfg.tradeNo])
+
+        var bodyDict: [String: Any] = ["email": cfg.email]
+        if let t = cfg.tradeNo, !t.isEmpty {
+            bodyDict["tradeNo"] = t
+        }
+        req.httpBody = try? JSONSerialization.data(withJSONObject: bodyDict)
         if cached != nil, let etag { req.setValue(etag, forHTTPHeaderField: "If-None-Match") }
 
         session.dataTask(with: req) { [weak self] data, resp, err in
-            let main: (Order?, String?) -> Void = { o, e in DispatchQueue.main.async { completion(o, e) } }
+            let main: (Order?, [KeyItem]?, String?) -> Void = { o, k, e in
+                DispatchQueue.main.async { completion(o, k, e) }
+            }
             if let err {
-                main(nil, "网络错误：\(err.localizedDescription)")
+                main(nil, nil, "网络错误：\(err.localizedDescription)")
                 return
             }
             guard let http = resp as? HTTPURLResponse, let data else {
-                main(nil, "响应异常")
+                main(nil, nil, "响应异常")
                 return
             }
             if http.statusCode == 304, let self, let c = self.cached {
-                main(c, nil)
+                main(c, nil, nil)
                 return
             }
             guard let root = try? JSONDecoder().decode(Root.self, from: data) else {
-                main(nil, "无法解析响应（HTTP \(http.statusCode)）")
+                main(nil, nil, "无法解析响应 (HTTP \(http.statusCode))")
                 return
             }
             switch (http.statusCode, root.success, root.order) {
-            case (200, true, let o?) where o.apiKey?.isEmpty == false:
+            case (200, true, let o?):
                 if let tag = http.value(forHTTPHeaderField: "ETag") { self?.etag = tag }
                 self?.cached = o
-                main(o, nil)
-            case (200, true, let o?) where o.status != "paid":
-                main(o, "订单未支付或 Key 未下发（status=\(o.status ?? "?")）")
+                if o.status != "paid" {
+                    main(o, root.keys, "订单未支付 (status=\(o.status ?? "?"))")
+                } else {
+                    main(o, root.keys, nil)
+                }
             case (404, _, _):
-                main(nil, root.error ?? "订单号与邮箱不匹配。")
+                main(nil, nil, root.error ?? "未查询到该邮箱的有效订单。")
             case (429, _, _):
-                main(nil, "查询过于频繁（429），稍后再试。")
+                main(nil, nil, "查询频繁 (429)，稍后再试。")
             default:
-                main(nil, root.error ?? "查询失败（HTTP \(http.statusCode)）")
+                main(nil, nil, root.error ?? "查询失败 (HTTP \(http.statusCode))")
             }
         }.resume()
     }
@@ -629,23 +693,26 @@ final class Agent: NSObject, NSMenuDelegate {
         item.button?.toolTip = tip
     }
 
+    var keys: [KeyItem] = []
+
     func refreshIfNeeded() {
         guard let cfg = Cfg.load() else {
-            setOrder(nil, note: "未配置：点击下方「设置…」填邮箱与订单号")
+            setOrder(nil, keys: [], note: "未配置：请填写下单邮箱")
             return
         }
-        fetcher.lookup(cfg) { [weak self] o, e in
-            guard let self else { return }
-            self.setOrder(o ?? self.order, note: e)
+        fetcher.lookup(cfg) { [weak self] o, k, e in
+            guard let self = self else { return }
+            self.setOrder(o ?? self.order, keys: k ?? self.keys, note: e)
         }
     }
 
-    func setOrder(_ o: Order?, note: String?) {
+    func setOrder(_ o: Order?, keys: [KeyItem]?, note: String?) {
         self.order = o
+        if let keys = keys { self.keys = keys }
         self.note = note
         self.render()
         DispatchQueue.main.async {
-            SettingsWindowController.shared.updateOrder(o, note: note)
+            SettingsWindowController.shared.update(order: o, keys: keys, note: note)
         }
     }
 
@@ -935,6 +1002,7 @@ final class Agent: NSObject, NSMenuDelegate {
 
 final class SettingsViewModel: ObservableObject {
     @Published var order: Order? = nil
+    @Published var keys: [KeyItem] = []
     @Published var pingStatus: String? = nil
     @Published var isPinging: Bool = false
     @Published var email: String = ""
@@ -959,6 +1027,7 @@ final class SettingsViewModel: ObservableObject {
     func loadFromCurrent(agent: Agent) {
         self.agent = agent
         self.order = agent.order
+        self.keys = agent.keys
         let cfg = Cfg.load()
         self.email = cfg?.email ?? ""
         self.tradeNo = cfg?.tradeNo ?? ""
@@ -1084,6 +1153,13 @@ final class SettingsViewModel: ObservableObject {
         }
     }
 
+    func selectTradeNo(_ no: String) {
+        self.tradeNo = no
+        Cfg.save(Config(email: email, tradeNo: no))
+        withAnimation { isRefreshing = true }
+        agent?.refreshIfNeeded()
+    }
+
     func pingModel() {
         guard let key = order?.apiKey ?? agent?.order?.apiKey, !key.isEmpty else {
             pingStatus = "⚠️ 未获取到有效 API Key"
@@ -1147,18 +1223,13 @@ final class SettingsViewModel: ObservableObject {
         let t = tradeNo.trimmingCharacters(in: .whitespacesAndNewlines)
 
         if e.isEmpty || !e.contains("@") {
-            validationError = "邮箱格式不正确"
-            saveSuccess = false
-            return
-        }
-        if t.isEmpty {
-            validationError = "订单号不可为空"
+            validationError = "请填写有效下单邮箱"
             saveSuccess = false
             return
         }
 
         validationError = nil
-        Cfg.save(Config(email: e, tradeNo: t))
+        Cfg.save(Config(email: e, tradeNo: t.isEmpty ? nil : t))
 
         if let agent = agent {
             if agent.autoRefresh != autoRefresh {
@@ -1358,6 +1429,9 @@ struct SettingsView: View {
                         updateBanner(u)
                     }
 
+                    // 多卡切换器 (若名下有多张卡)
+                    keySwitcher
+
                     if let o = model.order {
                         // 临期提醒
                         if isExpiringSoon(o) {
@@ -1496,6 +1570,76 @@ struct SettingsView: View {
         .padding(.vertical, 6)
         .background(Color.blue.opacity(0.06))
         .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+
+    // MARK: - 多卡切换器 (若有多张卡)
+    @ViewBuilder
+    private var keySwitcher: some View {
+        let usable = model.keys.filter { $0.keyActive == true || $0.latest == true }
+        if usable.count > 1 {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    Text("名下卡片 (\(usable.count) 张)")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Text("点击切换")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.tertiary)
+                }
+
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        ForEach(usable) { k in
+                            let isSelected = (k.tradeNo == model.order?.tradeNo) || (model.tradeNo.isEmpty && k.latest == true)
+                            let mask = k.apiKeyMasked ?? "••••"
+                            let short = mask.count > 8 ? String(mask.suffix(4)) : mask
+                            let days = Int((k.remainingMs ?? 0) / 1000 / 86400)
+
+                            Button {
+                                if let t = k.tradeNo {
+                                    model.selectTradeNo(t)
+                                }
+                            } label: {
+                                HStack(spacing: 5) {
+                                    Circle()
+                                        .fill(isSelected ? Visuals.flameOrange : (k.keyActive == true ? Color.green : Color.secondary))
+                                        .frame(width: 6, height: 6)
+
+                                    Text("••••\(short)")
+                                        .font(.system(.caption2, design: .monospaced).weight(.semibold))
+
+                                    Text("· \(days)d")
+                                        .font(.caption2)
+
+                                    if k.latest == true {
+                                        Text("最新")
+                                            .font(.system(size: 9, weight: .bold))
+                                            .padding(.horizontal, 4)
+                                            .padding(.vertical, 1)
+                                            .background(Visuals.flameOrange.opacity(0.15))
+                                            .foregroundStyle(Visuals.flameOrange)
+                                            .clipShape(Capsule())
+                                    }
+                                }
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 4)
+                                .background(isSelected ? Visuals.flameOrange.opacity(0.12) : Color.primary.opacity(0.04))
+                                .foregroundStyle(isSelected ? Visuals.flameOrange : .primary)
+                                .clipShape(Capsule())
+                                .overlay(
+                                    Capsule()
+                                        .stroke(isSelected ? Visuals.flameOrange.opacity(0.4) : Color.clear, lineWidth: 1)
+                                )
+                            }
+                            .buttonStyle(.borderless)
+                        }
+                    }
+                    .padding(.vertical, 2)
+                }
+            }
+            .padding(.horizontal, 2)
+        }
     }
 
     // MARK: - 到期续费横幅
@@ -1642,11 +1786,11 @@ struct SettingsView: View {
                             Text("Key")
                                 .font(.caption.weight(.semibold))
                                 .frame(width: 45, alignment: .leading)
-                            Text(masked(key))
+                            Text(masked(o.displayKey))
                                 .font(.system(.caption, design: .monospaced))
                             Spacer()
                             Button(model.copiedKey ? "已复制" : "复制") {
-                                model.copyKey(key)
+                                model.copyKey(o.displayKey)
                             }
                             .buttonStyle(.bordered)
                             .controlSize(.small)
@@ -1821,7 +1965,7 @@ struct SettingsView: View {
         MetricCard(title: "账号凭据", icon: "person.crop.circle", iconColor: .primary) {
             VStack(spacing: 8) {
                 HStack(spacing: 6) {
-                    Text("邮箱").font(.caption.weight(.medium)).frame(width: 45, alignment: .leading)
+                    Text("下单邮箱").font(.caption.weight(.medium)).frame(width: 55, alignment: .leading)
                     TextField("your@email.com", text: $model.email).textFieldStyle(.roundedBorder)
                     if !model.email.isEmpty {
                         Button(model.copiedEmail ? "已复制" : "复制") { model.copyEmail() }
@@ -1832,8 +1976,8 @@ struct SettingsView: View {
                 }
 
                 HStack(spacing: 6) {
-                    Text("订单号").font(.caption.weight(.medium)).frame(width: 45, alignment: .leading)
-                    TextField("MK...", text: $model.tradeNo).textFieldStyle(.roundedBorder).font(.system(.body, design: .monospaced))
+                    Text("指定卡号").font(.caption.weight(.medium)).frame(width: 55, alignment: .leading)
+                    TextField("选填 · 默认自动匹配最新卡", text: $model.tradeNo).textFieldStyle(.roundedBorder).font(.system(.body, design: .monospaced))
                     if !model.tradeNo.isEmpty {
                         Button(model.copiedTradeNo ? "已复制" : "复制") { model.copyTradeNo() }
                             .buttonStyle(.bordered).controlSize(.small)
@@ -1846,7 +1990,7 @@ struct SettingsView: View {
                     if let err = model.validationError {
                         Text(err).font(.caption2).foregroundStyle(.red)
                     } else {
-                        Text("凭据仅存本机，支持 ⌘C / ⌘V。").font(.caption2).foregroundStyle(.secondary)
+                        Text("现支持纯邮箱查询。若有多张卡，可在上方直接点击切换。").font(.caption2).foregroundStyle(.secondary)
                     }
                     Spacer()
                 }
@@ -1955,10 +2099,14 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
     private var window: NSWindow?
     private var model = SettingsViewModel()
 
-    func updateOrder(_ o: Order?, note: String?) {
-        model.order = o
+    func update(order: Order?, keys: [KeyItem]?, note: String?) {
+        model.order = order
+        if let keys = keys { model.keys = keys }
         model.isRefreshing = false
-        if o != nil {
+        if let note = note, order == nil {
+            model.validationError = note
+        }
+        if order != nil {
             model.email = Cfg.load()?.email ?? model.email
             model.tradeNo = Cfg.load()?.tradeNo ?? model.tradeNo
         }
@@ -2010,7 +2158,9 @@ func cliExit(_ cfg: Config?, wantJSON: Bool) -> Int32 {
     var req = URLRequest(url: Cfg.endpoint)
     req.httpMethod = "POST"
     req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-    req.httpBody = try? JSONSerialization.data(withJSONObject: ["email": cfg.email, "tradeNo": cfg.tradeNo])
+    var bodyDict: [String: Any] = ["email": cfg.email]
+    if let t = cfg.tradeNo, !t.isEmpty { bodyDict["tradeNo"] = t }
+    req.httpBody = try? JSONSerialization.data(withJSONObject: bodyDict)
     URLSession.shared.dataTask(with: req) { data, resp, err in
         defer { sem.signal() }
         if let err {
