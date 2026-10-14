@@ -1,0 +1,93 @@
+# Build MonkUsage.app on a Mac runner and attach the zip to the GitHub release.
+# Signing is ad-hoc only (./build.sh). No Developer ID or notarization secrets.
+name: Release macOS app
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: |
+          xcodebuild -version
+          swiftc --version
+          python3 --version
+
+      - name: Install Pillow
+        run: |
+          set -euo pipefail
+          python3 -m pip install --break-system-packages Pillow \
+            || python3 -m pip install --user Pillow
+          python3 -c 'import PIL; print("Pillow", PIL.__version__)'
+
+      - name: Build
+        run: ./build.sh
+
+      - name: Check binary
+        run: |
+          set -euo pipefail
+          BIN="build/MonkUsage.app/Contents/MacOS/monk-usage"
+          PLIST="build/MonkUsage.app/Contents/Info.plist"
+          lipo -info "$BIN"
+          lipo -info "$BIN" | grep -q arm64
+          lipo -info "$BIN" | grep -q x86_64
+          VER=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$PLIST")
+          echo "CFBundleShortVersionString=$VER"
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            if [ "${GITHUB_REF_NAME}" != "v${VER}" ]; then
+              echo "tag ${GITHUB_REF_NAME} does not match app version ${VER}"
+              exit 1
+            fi
+          fi
+          test -s "build/MonkUsage.app/Contents/Resources/AppIcon.icns"
+          echo "version=${VER}" >> "$GITHUB_ENV"
+
+      - name: Package zip
+        run: |
+          set -euo pipefail
+          ASSET="MonkUsage-v${version}-macOS-Tahoe-Universal.zip"
+          ditto -c -k --keepParent "build/MonkUsage.app" "$ASSET"
+          unzip -t "$ASSET"
+          SIZE=$(stat -f%z "$ASSET")
+          echo "zip bytes: ${SIZE}"
+          test "$SIZE" -gt 100000
+          echo "ASSET=${ASSET}" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MonkUsage-v${{ env.version }}-macOS-Tahoe-Universal
+          path: ${{ env.ASSET }}
+          if-no-files-found: error
+
+      - name: Publish GitHub release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          NOTES="release-notes/${TAG}.md"
+          test -f "$NOTES"
+          TITLE=$(grep -m1 '^title: ' "$NOTES" | sed 's/^title: //')
+          test -n "$TITLE"
+          tail -n +2 "$NOTES" > /tmp/release-body.md
+          LABEL="${ASSET} (Universal 2: macOS 13+, Tahoe 26, Golden Gate 27 arm64)"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "${ASSET}#${LABEL}" --clobber
+          else
+            gh release create "$TAG" \
+              --target "$GITHUB_SHA" \
+              --title "$TITLE" \
+              --notes-file /tmp/release-body.md \
+              "${ASSET}#${LABEL}"
+          fi
