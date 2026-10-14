@@ -8,8 +8,11 @@
 //    monk-usage --config        打印配置文件路径
 //    monk-usage --selfcheck     跑内置自检（解码 + 格式化）
 //
-//  接口：POST https://monk.party/monk-api/lookup-order  body {"email":..,"tradeNo":..}
-//  官方提示「一次查询计算一次今日用量」，故自动刷新默认关闭，手动 ⌘R。
+//  用量接口与官网账户页相同：POST https://monk.party/monk-api/lookup-order
+//  body {"email":..}，多卡时再带 {"tradeNo":..}。
+//  2026-10 起响应只给 Key 末四位（apiKeyMasked），完整 sk-monk-* 在购买邮件里。
+//  付费 Key 可调用 monk / monk-fast / monk-coding / monk-free。Base URL https://monk.party/v1。
+//  自动刷新默认关闭，手动 ⌘R。
 //
 
 import AppKit
@@ -87,17 +90,103 @@ enum Visuals {
     }
 }
 
+// MARK: - 当前服务常量（缺字段时的兜底；响应里的数字优先）
+
+enum AppMeta {
+    /// 与 build.sh 里的 CFBundleShortVersionString 保持一致。
+    static let version = "1.6.0"
+}
+
+struct MonkModelOption: Identifiable {
+    let name: String
+    let blurb: String
+    var id: String { name }
+}
+
+enum MonkCatalog {
+    static let baseURL = "https://monk.party/v1"
+    static let pingModel = "monk-fast"
+    static let options: [MonkModelOption] = [
+        MonkModelOption(name: "monk", blurb: "默认"),
+        MonkModelOption(name: "monk-fast", blurb: "极速"),
+        MonkModelOption(name: "monk-coding", blurb: "代码"),
+        MonkModelOption(name: "monk-free", blurb: "均可"),
+    ]
+}
+
+enum MonkLimits {
+    /// 公开默认值，见 2026-10-14 llms-full.txt。服务端 fairness / dailyLimit 一律优先。
+    static let daily = 200.0
+    static let hourMax = 800.0
+    static let hourPrompt = 60_000_000.0
+    static let sixHourMax = 2_400.0
+    static let sixHourPrompt = 90_000_000.0
+}
+
+/// 购买邮件里的完整 Key。掩码（含 •）和空串都不当成可调用密钥。
+func isFullKey(_ raw: String?) -> String? {
+    var k = raw?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    if k.lowercased().hasPrefix("bearer ") {
+        k = String(k.dropFirst(7)).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+    let allowed = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_")
+    guard k.count >= 12,
+          k.unicodeScalars.allSatisfy({ allowed.contains($0) }),
+          k.hasPrefix("sk-monk-") || k.hasPrefix("monk-")
+    else { return nil }
+    return k
+}
+
+func lookupFailureMessage(status: Int, error: String?) -> String {
+    let raw = error?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    if status == 429 || raw.localizedCaseInsensitiveContains("too many") {
+        return "查询太频繁，请稍后再试。"
+    }
+    if status == 404 || raw == "No matching order." || raw == "Not Found" {
+        return "未查到该邮箱的已支付订单。"
+    }
+    if !raw.isEmpty { return raw }
+    return "查询失败 (HTTP \(status))"
+}
+
+func usableKeys(_ keys: [KeyItem]) -> [KeyItem] {
+    keys.filter { $0.expired != true }
+}
+
+func maskedKey(_ key: String?) -> String {
+    guard let key, !key.isEmpty else { return "sk-monk-••••" }
+    if key.contains("•") || key.count <= 12 { return key }
+    let head = key.hasPrefix("sk-monk-") ? "sk-monk-" : String(key.prefix(7))
+    return head + "…" + String(key.suffix(4))
+}
+
 // MARK: - 配置
 
 struct Config: Codable {
     var email: String
     var tradeNo: String?
+    /// 只留在本机，供连通性测试。用量查询不上传这个字段。
+    var apiKey: String?
 }
 
 enum Cfg {
     static let endpoint = URL(string: "https://monk.party/monk-api/lookup-order")!
     static let accountPage = URL(string: "https://monk.party/account/")!
+    static let helpPage = URL(string: "https://monk.party/help/")!
     static let charterPage = URL(string: "https://monk.party/charter/")!
+    static let homePage = URL(string: "https://monk.party/")!
+
+    /// 账户页会读取 ?email= 与 ?trade= 并自动查询，续费同一把 Key 也在这一页。
+    static func accountURL(email: String?, tradeNo: String?) -> URL {
+        guard var parts = URLComponents(url: accountPage, resolvingAgainstBaseURL: false) else { return accountPage }
+        var items: [URLQueryItem] = []
+        let mail = email?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let trade = tradeNo?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !mail.isEmpty { items.append(URLQueryItem(name: "email", value: mail)) }
+        if !trade.isEmpty { items.append(URLQueryItem(name: "trade", value: trade)) }
+        if !items.isEmpty { parts.queryItems = items }
+        return parts.url ?? accountPage
+    }
 
     static var dir: URL {
         let fm = FileManager.default
@@ -116,12 +205,22 @@ enum Cfg {
         let env = ProcessInfo.processInfo.environment
         if let e = env["MONK_EMAIL"], !e.isEmpty {
             let t = env["MONK_TRADENO"]
-            return Config(email: e, tradeNo: (t?.isEmpty == false) ? t : nil)
+            let k = env["MONK_API_KEY"]
+            return Config(
+                email: e,
+                tradeNo: (t?.isEmpty == false) ? t : nil,
+                apiKey: isFullKey(k)
+            )
         }
         guard let data = try? Data(contentsOf: url),
-              let c = try? JSONDecoder().decode(Config.self, from: data),
+              var c = try? JSONDecoder().decode(Config.self, from: data),
               !c.email.isEmpty, c.email.contains("@"), !c.email.contains("example.com")
         else { return nil }
+        if isFullKey(c.apiKey) == nil, let k = isFullKey(env["MONK_API_KEY"]) {
+            c.apiKey = k
+        } else {
+            c.apiKey = isFullKey(c.apiKey)
+        }
         return c
     }
 
@@ -149,7 +248,7 @@ struct UpdateInfo {
 
 enum UpdateChecker {
     static let apiURL = URL(string: "https://api.github.com/repos/yaoleifly/monk-bar/releases/latest")!
-    static let currentVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.3.1"
+    static let currentVersion = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? AppMeta.version
 
     /// 比较 semver：latest > current 返回 true
     static func isNewer(latest: String, current: String) -> Bool {
@@ -270,9 +369,6 @@ struct Order: Codable {
     var apiKeyMasked: String?
     var tradeNo: String?
     var status: String?
-    var money: String?
-    var baseUrl: String?
-    var model: String?
     var createdAt: String?
     var paidAt: String?
     var expiresAt: String?
@@ -282,22 +378,19 @@ struct Order: Codable {
     var keyActive: Bool?
     var dailyCost: Double?
     var dailyLimit: Double?
-    var dailyReset: String?
     var tokens: Tokens?
     var fairness: Fairness?
     var rateLimit: RateLimit?
     var cooldownUntil: String?
 
+    /// 账户页现在只下发掩码。旧响应若仍带完整 apiKey，显示时再截短。
     var displayKey: String { apiKeyMasked ?? apiKey ?? "sk-monk-••••" }
 
-    init(apiKey: String? = nil, apiKeyMasked: String? = nil, tradeNo: String? = nil, status: String? = nil, money: String? = nil, baseUrl: String? = nil, model: String? = nil, createdAt: String? = nil, paidAt: String? = nil, expiresAt: String? = nil, remainingMs: Double? = nil, expired: Bool? = nil, soon: Bool? = nil, keyActive: Bool? = nil, dailyCost: Double? = nil, dailyLimit: Double? = nil, dailyReset: String? = nil, tokens: Tokens? = nil, fairness: Fairness? = nil, rateLimit: RateLimit? = nil, cooldownUntil: String? = nil) {
+    init(apiKey: String? = nil, apiKeyMasked: String? = nil, tradeNo: String? = nil, status: String? = nil, createdAt: String? = nil, paidAt: String? = nil, expiresAt: String? = nil, remainingMs: Double? = nil, expired: Bool? = nil, soon: Bool? = nil, keyActive: Bool? = nil, dailyCost: Double? = nil, dailyLimit: Double? = nil, tokens: Tokens? = nil, fairness: Fairness? = nil, rateLimit: RateLimit? = nil, cooldownUntil: String? = nil) {
         self.apiKey = apiKey
         self.apiKeyMasked = apiKeyMasked
         self.tradeNo = tradeNo
         self.status = status
-        self.money = money
-        self.baseUrl = baseUrl
-        self.model = model
         self.createdAt = createdAt
         self.paidAt = paidAt
         self.expiresAt = expiresAt
@@ -307,12 +400,17 @@ struct Order: Codable {
         self.keyActive = keyActive
         self.dailyCost = dailyCost
         self.dailyLimit = dailyLimit
-        self.dailyReset = dailyReset
         self.tokens = tokens
         self.fairness = fairness
         self.rateLimit = rateLimit
         self.cooldownUntil = cooldownUntil
     }
+}
+
+/// 响应里的完整 Key 优先，否则用本机配置。掩码不能拿去调用。
+func fullApiKey(order: Order?) -> String? {
+    if let k = isFullKey(order?.apiKey) { return k }
+    return isFullKey(Cfg.load()?.apiKey)
 }
 
 struct Root: Codable {
@@ -373,16 +471,14 @@ final class Fetcher {
                 if let tag = http.value(forHTTPHeaderField: "ETag") { self?.etag = tag }
                 self?.cached = o
                 if o.status != "paid" {
-                    main(o, root.keys, "订单未支付 (status=\(o.status ?? "?"))")
+                    main(o, root.keys, "订单尚未完成支付。")
                 } else {
                     main(o, root.keys, nil)
                 }
-            case (404, _, _):
-                main(nil, nil, root.error ?? "未查询到该邮箱的有效订单。")
-            case (429, _, _):
-                main(nil, nil, "查询频繁 (429)，稍后再试。")
+            case (404, _, _), (429, _, _):
+                main(nil, nil, lookupFailureMessage(status: http.statusCode, error: root.error))
             default:
-                main(nil, nil, root.error ?? "查询失败 (HTTP \(http.statusCode))")
+                main(nil, nil, lookupFailureMessage(status: http.statusCode, error: root.error))
             }
         }.resume()
     }
@@ -524,7 +620,7 @@ func summaryLine(_ o: Order) -> String {
         "今日 \(Fmt.money(o.dailyCost))/\(Fmt.money(o.dailyLimit)) \(Fmt.bar(o.dailyCost, o.dailyLimit))",
         "1h \(Fmt.num(o.rateLimit?.hour?.w))/\(Fmt.num(o.fairness?.hourMax)) 次 · \(Fmt.tok(o.rateLimit?.hour?.pin))/\(Fmt.tok(o.fairness?.hourPrompt)) in",
         "6h \(Fmt.num(o.rateLimit?.six?.w))/\(Fmt.num(o.fairness?.sixHourMax)) 次 · \(Fmt.tok(o.rateLimit?.six?.pin))/\(Fmt.tok(o.fairness?.sixHourPrompt)) in",
-        "Token 累计 \(Fmt.tok(o.tokens?.total))（入 \(Fmt.tok(o.tokens?.prompt)) · 出 \(Fmt.tok(o.tokens?.completion))）",
+        "近 14 天 \(Fmt.tok(o.tokens?.total))（入 \(Fmt.tok(o.tokens?.prompt)) · 出 \(Fmt.tok(o.tokens?.completion))）",
         "剩余 \(Fmt.left(o.remainingMs, expired: o.expired == true)) 至 \(Fmt.date(o.expiresAt))",
         st.bad ? "到期 \(Fmt.date(o.expiresAt)) · 详见 https://monk.party/account/" : ""
     ].filter { !$0.isEmpty }.joined(separator: " | ")
@@ -582,7 +678,7 @@ func makeStatusAttributedTitle(
     result.append(primary)
 
     if mode == .detailed {
-        let lim = max(0.01, limit ?? 30.0)
+        let lim = max(0.01, limit ?? MonkLimits.daily)
         let pct = Int(min(100, max(0, (c / lim) * 100)))
         let pctAttr = NSAttributedString(string: " (\(pct)%)", attributes: [
             .font: NSFont.monospacedDigitSystemFont(ofSize: 10.5, weight: .regular),
@@ -611,26 +707,29 @@ func makeStatusAttributedTitle(
     return result
 }
 
-// MARK: - 系统适配与信息 (macOS 13+ / macOS Tahoe 27+)
+// MARK: - 系统适配与信息 (macOS 13+；26 Tahoe，27 Golden Gate)
 
 enum SystemInfo {
+    static func marketingName(major: Int, minor: Int) -> String {
+        switch major {
+        case 27:
+            return "macOS Golden Gate (27.\(minor))"
+        case 26:
+            return "macOS Tahoe (26.\(minor))"
+        case 15:
+            return "macOS Sequoia (15.\(minor))"
+        case 14:
+            return "macOS Sonoma (14.\(minor))"
+        case 13:
+            return "macOS Ventura (13.\(minor))"
+        default:
+            return "macOS (\(major).\(minor))"
+        }
+    }
+
     static var macOSName: String {
         let v = ProcessInfo.processInfo.operatingSystemVersion
-        switch v.majorVersion {
-        case 26, 27:
-            return "macOS Tahoe (\(v.majorVersion).\(v.minorVersion))"
-        case 15:
-            return "macOS Sequoia (15.\(v.minorVersion))"
-        case 14:
-            return "macOS Sonoma (14.\(v.minorVersion))"
-        case 13:
-            return "macOS Ventura (13.\(v.minorVersion))"
-        default:
-            if v.majorVersion >= 26 {
-                return "macOS Tahoe (\(v.majorVersion).\(v.minorVersion))"
-            }
-            return "macOS (\(v.majorVersion).\(v.minorVersion))"
-        }
+        return marketingName(major: v.majorVersion, minor: v.minorVersion)
     }
 }
 
@@ -813,6 +912,10 @@ final class Agent: NSObject, NSMenuDelegate {
         charterItem.target = self
         menu.addItem(charterItem)
 
+        let helpItem = NSMenuItem(title: "帮助中心 ↗", action: #selector(doHelp), keyEquivalent: "")
+        helpItem.target = self
+        menu.addItem(helpItem)
+
         menu.addItem(.separator())
         let conf = NSMenuItem(title: "设置…", action: #selector(doSettings), keyEquivalent: ",")
         conf.target = self
@@ -829,10 +932,18 @@ final class Agent: NSObject, NSMenuDelegate {
     func addOrderItems(to menu: NSMenu, _ o: Order) {
         let st = state(o)
         menu.addItem(info("状态　\(st.label)"))
-        menu.addItem(info("Key　　\(masked(o.apiKey))　(复制)", action: #selector(doCopyKey), target: self))
+        if fullApiKey(order: o) != nil {
+            menu.addItem(info("Key　　\(masked(o.displayKey))　(复制)", action: #selector(doCopyKey), target: self))
+        } else {
+            menu.addItem(info("Key　　\(masked(o.displayKey))　(完整密钥在购买邮件)"))
+        }
         menu.addItem(info("剩余　\(Fmt.left(o.remainingMs, expired: o.expired == true)) · 到期 \(Fmt.date(o.expiresAt))"))
+        if let opened = o.paidAt ?? o.createdAt {
+            menu.addItem(info("开通　\(Fmt.date(opened))"))
+        }
         menu.addItem(info("今日　\(Fmt.bar(o.dailyCost, o.dailyLimit)) \(Fmt.money(o.dailyCost)) / \(Fmt.money(o.dailyLimit))"))
-        menu.addItem(info("Token　\(Fmt.tok(o.tokens?.total)) (入 \(Fmt.tok(o.tokens?.prompt)) · 出 \(Fmt.tok(o.tokens?.completion)))"))
+        menu.addItem(info("近14天　\(Fmt.tok(o.tokens?.total)) (入 \(Fmt.tok(o.tokens?.prompt)) · 出 \(Fmt.tok(o.tokens?.completion)))"))
+        menu.addItem(info("模型　monk · monk-fast · monk-coding · monk-free"))
 
         if let r = o.rateLimit, let fair = o.fairness {
             menu.addItem(.separator())
@@ -845,10 +956,7 @@ final class Agent: NSObject, NSMenuDelegate {
         }
     }
 
-    func masked(_ key: String?) -> String {
-        guard let key, key.count > 10 else { return key ?? "—" }
-        return key.prefix(6) + "…" + key.suffix(4)
-    }
+    func masked(_ key: String?) -> String { maskedKey(key) }
 
     @discardableResult
     func info(_ text: String, multiline: Bool = false,
@@ -876,7 +984,13 @@ final class Agent: NSObject, NSMenuDelegate {
     @objc func doRefresh() { refreshIfNeeded() }
 
     @objc func doOpenPricing() {
-        NSWorkspace.shared.open(URL(string: "https://monk.party/")!)
+        let cfg = Cfg.load()
+        let trade = order?.tradeNo ?? cfg?.tradeNo
+        NSWorkspace.shared.open(Cfg.accountURL(email: cfg?.email, tradeNo: trade))
+    }
+
+    @objc func doHelp() {
+        NSWorkspace.shared.open(Cfg.helpPage)
     }
 
     @objc func doCharter() {
@@ -968,7 +1082,11 @@ final class Agent: NSObject, NSMenuDelegate {
         item.menu?.delegate?.menuNeedsUpdate?(item.menu!)
     }
 
-    @objc func doAccount() { NSWorkspace.shared.open(Cfg.accountPage) }
+    @objc func doAccount() {
+        let cfg = Cfg.load()
+        let trade = order?.tradeNo ?? cfg?.tradeNo
+        NSWorkspace.shared.open(Cfg.accountURL(email: cfg?.email, tradeNo: trade))
+    }
 
     @objc func doSettings() {
         NSApp.activate(ignoringOtherApps: true)
@@ -981,7 +1099,11 @@ final class Agent: NSObject, NSMenuDelegate {
     }
 
     @objc func doCopyKey() {
-        guard let key = order?.apiKey, !key.isEmpty else { return }
+        guard let key = fullApiKey(order: order) else {
+            note = "查询只返回末四位。完整 Key 在购买邮件里，可填到设置里的「本机 Key」。"
+            render()
+            return
+        }
         let pb = NSPasteboard.general
         pb.clearContents()
         pb.setString(key, forType: .string)
@@ -1007,6 +1129,7 @@ final class SettingsViewModel: ObservableObject {
     @Published var isPinging: Bool = false
     @Published var email: String = ""
     @Published var tradeNo: String = ""
+    @Published var apiKey: String = ""
     @Published var autoRefresh: Bool = false
     @Published var statusDisplayMode: StatusDisplayMode = .detailed
     @Published var autoCheckUpdates: Bool = true
@@ -1031,6 +1154,7 @@ final class SettingsViewModel: ObservableObject {
         let cfg = Cfg.load()
         self.email = cfg?.email ?? ""
         self.tradeNo = cfg?.tradeNo ?? ""
+        self.apiKey = cfg?.apiKey ?? ""
         self.autoRefresh = agent.autoRefresh
         self.statusDisplayMode = agent.displayMode
         self.autoCheckUpdates = agent.autoCheckUpdates
@@ -1078,6 +1202,11 @@ final class SettingsViewModel: ObservableObject {
         }
     }
 
+    func pasteApiKey() {
+        guard let s = NSPasteboard.general.string(forType: .string)?.trimmingCharacters(in: .whitespacesAndNewlines), !s.isEmpty else { return }
+        self.apiKey = isFullKey(s) ?? s
+    }
+
     func copyKey(_ key: String) {
         let pb = NSPasteboard.general
         pb.clearContents()
@@ -1091,7 +1220,7 @@ final class SettingsViewModel: ObservableObject {
     func copyBaseURL() {
         let pb = NSPasteboard.general
         pb.clearContents()
-        pb.setString("https://monk.party/v1", forType: .string)
+        pb.setString(MonkCatalog.baseURL, forType: .string)
         withAnimation(.easeInOut(duration: 0.15)) { copiedBaseURL = true }
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
             withAnimation { self?.copiedBaseURL = false }
@@ -1123,7 +1252,16 @@ final class SettingsViewModel: ObservableObject {
     }
 
     func openPricing() {
-        NSWorkspace.shared.open(URL(string: "https://monk.party/")!)
+        let trade = order?.tradeNo ?? (tradeNo.isEmpty ? nil : tradeNo)
+        NSWorkspace.shared.open(Cfg.accountURL(email: email, tradeNo: trade))
+    }
+
+    func openHelp() {
+        NSWorkspace.shared.open(Cfg.helpPage)
+    }
+
+    func openHome() {
+        NSWorkspace.shared.open(Cfg.homePage)
     }
 
     func openCharter() {
@@ -1155,27 +1293,34 @@ final class SettingsViewModel: ObservableObject {
 
     func selectTradeNo(_ no: String) {
         self.tradeNo = no
-        Cfg.save(Config(email: email, tradeNo: no))
+        let typed = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        let kept: String?
+        if typed.isEmpty {
+            kept = nil
+        } else {
+            kept = isFullKey(typed) ?? Cfg.load()?.apiKey
+        }
+        Cfg.save(Config(email: email, tradeNo: no, apiKey: kept))
         withAnimation { isRefreshing = true }
         agent?.refreshIfNeeded()
     }
 
     func pingModel() {
-        guard let key = order?.apiKey ?? agent?.order?.apiKey, !key.isEmpty else {
-            pingStatus = "⚠️ 未获取到有效 API Key"
+        guard let key = fullApiKey(order: order ?? agent?.order) else {
+            pingStatus = "没有完整 Key。查询只给末四位，把购买邮件里的 sk-monk-… 填到「本机 Key」。"
             return
         }
         isPinging = true
-        pingStatus = "正在测试调用 monk-fast…"
+        pingStatus = "正在测试调用 \(MonkCatalog.pingModel)…"
 
         let start = Date()
-        var req = URLRequest(url: URL(string: "https://monk.party/v1/chat/completions")!)
+        var req = URLRequest(url: URL(string: MonkCatalog.baseURL + "/chat/completions")!)
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
         req.timeoutInterval = 10
         let payload: [String: Any] = [
-            "model": "monk-fast",
+            "model": MonkCatalog.pingModel,
             "messages": [["role": "user", "content": "hi"]],
             "max_tokens": 5
         ]
@@ -1221,15 +1366,27 @@ final class SettingsViewModel: ObservableObject {
     func saveAndRefresh() {
         let e = email.trimmingCharacters(in: .whitespacesAndNewlines)
         let t = tradeNo.trimmingCharacters(in: .whitespacesAndNewlines)
+        let rawKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
 
         if e.isEmpty || !e.contains("@") {
             validationError = "请填写有效下单邮箱"
             saveSuccess = false
             return
         }
+        let storedKey: String?
+        if rawKey.isEmpty {
+            storedKey = nil
+        } else if let k = isFullKey(rawKey) {
+            storedKey = k
+            apiKey = k
+        } else {
+            validationError = "本机 Key 应以 sk-monk- 开头，或留空"
+            saveSuccess = false
+            return
+        }
 
         validationError = nil
-        Cfg.save(Config(email: e, tradeNo: t.isEmpty ? nil : t))
+        Cfg.save(Config(email: e, tradeNo: t.isEmpty ? nil : t, apiKey: storedKey))
 
         if let agent = agent {
             if agent.autoRefresh != autoRefresh {
@@ -1481,7 +1638,7 @@ struct SettingsView: View {
                     statusBadge
                 }
                 HStack(spacing: 4) {
-                    Text("融合模型")
+                    Text("四个融合模型")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                     Text("·")
@@ -1575,7 +1732,7 @@ struct SettingsView: View {
     // MARK: - 多卡切换器 (若有多张卡)
     @ViewBuilder
     private var keySwitcher: some View {
-        let usable = model.keys.filter { $0.keyActive == true || $0.latest == true }
+        let usable = usableKeys(model.keys)
         if usable.count > 1 {
             VStack(alignment: .leading, spacing: 6) {
                 HStack {
@@ -1680,7 +1837,7 @@ struct SettingsView: View {
             // Row 1: 今日内部计量 + 订阅有效期限
             HStack(spacing: 10) {
                 let cost = o.dailyCost ?? 0
-                let limit = max(0.01, o.dailyLimit ?? 30.0)
+                let limit = max(0.01, o.dailyLimit ?? MonkLimits.daily)
                 let pct = Int(min(100, max(0, (cost / limit) * 100)))
 
                 MetricCard(title: "今日内部计量", icon: "flame.fill", iconColor: Visuals.flameOrange, badge: "保险丝", badgeColor: Visuals.flameOrange) {
@@ -1746,7 +1903,7 @@ struct SettingsView: View {
 
             // Row 2: Token 消耗
             if let tok = o.tokens, let total = tok.total, total > 0 {
-                MetricCard(title: "Token 消耗", icon: "gauge", iconColor: .indigo, badge: "\(Fmt.tok(total))", badgeColor: .indigo) {
+                MetricCard(title: "近 14 天 Token", icon: "gauge", iconColor: .indigo, badge: "\(Fmt.tok(total))", badgeColor: .indigo) {
                     TokenSegmentBar(prompt: tok.prompt ?? 0, completion: tok.completion ?? 0)
                 }
             }
@@ -1758,14 +1915,14 @@ struct SettingsView: View {
                         HStack(alignment: .top, spacing: 12) {
                             VStack(alignment: .leading, spacing: 4) {
                                 Text("1 小时窗口").font(.caption2.weight(.semibold))
-                                RateLimitRow(title: "加权请求", current: r.hour?.w ?? 0, maxVal: fair.hourMax ?? 60, isToken: false)
-                                RateLimitRow(title: "输入 Token", current: r.hour?.pin ?? 0, maxVal: fair.hourPrompt ?? 30_000_000, isToken: true)
+                                RateLimitRow(title: "加权请求", current: r.hour?.w ?? 0, maxVal: fair.hourMax ?? MonkLimits.hourMax, isToken: false)
+                                RateLimitRow(title: "输入 Token", current: r.hour?.pin ?? 0, maxVal: fair.hourPrompt ?? MonkLimits.hourPrompt, isToken: true)
                             }
                             Divider().frame(height: 50)
                             VStack(alignment: .leading, spacing: 4) {
                                 Text("6 小时窗口").font(.caption2.weight(.semibold))
-                                RateLimitRow(title: "加权请求", current: r.six?.w ?? 0, maxVal: fair.sixHourMax ?? 200, isToken: false)
-                                RateLimitRow(title: "输入 Token", current: r.six?.pin ?? 0, maxVal: fair.sixHourPrompt ?? 120_000_000, isToken: true)
+                                RateLimitRow(title: "加权请求", current: r.six?.w ?? 0, maxVal: fair.sixHourMax ?? MonkLimits.sixHourMax, isToken: false)
+                                RateLimitRow(title: "输入 Token", current: r.six?.pin ?? 0, maxVal: fair.sixHourPrompt ?? MonkLimits.sixHourPrompt, isToken: true)
                             }
                         }
 
@@ -1774,13 +1931,16 @@ struct SettingsView: View {
                             ruleCapsule(icon: "archivebox.fill", text: "突发桶: \(Fmt.num(fair.burstCapacity)) / 补 \(Fmt.num(fair.burstRefillPerMin))")
                             ruleCapsule(icon: "shield.fill", text: "超 \(Fmt.num(fair.penalty429PerMin))次 429 罚 \(Fmt.num(fair.penaltyMinutes))分")
                         }
+                        Text("权重：普通请求计 1；输入超过 3.2 万 Token 计 2；超过 8 万计 4。数字以本次查询返回为准。")
+                            .font(.system(size: 9))
+                            .foregroundStyle(.tertiary)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
                 }
             }
 
-            // Row 4: API 与模型
-            if let key = o.apiKey, !key.isEmpty {
-                MetricCard(title: "API 与模型", icon: "terminal.fill", iconColor: .purple) {
+            // Row 4: API 与模型。查询接口只保证掩码，完整 Key 可能不在响应里。
+            MetricCard(title: "API 与模型", icon: "terminal.fill", iconColor: .purple) {
                     VStack(spacing: 6) {
                         HStack {
                             Text("Key")
@@ -1789,18 +1949,24 @@ struct SettingsView: View {
                             Text(masked(o.displayKey))
                                 .font(.system(.caption, design: .monospaced))
                             Spacer()
-                            Button(model.copiedKey ? "已复制" : "复制") {
-                                model.copyKey(o.displayKey)
+                            if let full = fullApiKey(order: o) {
+                                Button(model.copiedKey ? "已复制" : "复制") {
+                                    model.copyKey(full)
+                                }
+                                .buttonStyle(.bordered)
+                                .controlSize(.small)
+                            } else {
+                                Text("完整 Key 在邮件")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
                             }
-                            .buttonStyle(.bordered)
-                            .controlSize(.small)
                         }
 
                         HStack {
                             Text("URL")
                                 .font(.caption.weight(.semibold))
                                 .frame(width: 45, alignment: .leading)
-                            Text("https://monk.party/v1")
+                            Text(MonkCatalog.baseURL)
                                 .font(.system(.caption, design: .monospaced))
                             Spacer()
                             Button(model.copiedBaseURL ? "已复制" : "复制") {
@@ -1812,9 +1978,9 @@ struct SettingsView: View {
 
                         HStack(spacing: 6) {
                             Text("模型:").font(.caption2).foregroundStyle(.secondary)
-                            modelTag(name: "monk", desc: "默认")
-                            modelTag(name: "monk-fast", desc: "极速")
-                            modelTag(name: "monk-coding", desc: "代码")
+                            ForEach(MonkCatalog.options) { item in
+                                modelTag(name: item.name, desc: item.blurb)
+                            }
                             Spacer()
                         }
 
@@ -1845,7 +2011,6 @@ struct SettingsView: View {
                         }
                     }
                 }
-            }
         }
     }
 
@@ -1890,12 +2055,13 @@ struct SettingsView: View {
             Text("未配置凭据")
                 .font(.system(size: 13, weight: .bold))
 
-            Text("在下方填写下单邮箱与订单号 (MK...)，点击「保存」同步。")
+            Text("填写下单邮箱即可查询。订单号 (MK…) 只在要指定某一张卡时才需要。")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
 
             Button {
-                NSWorkspace.shared.open(Cfg.accountPage)
+                model.openHome()
             } label: {
                 Label("前往 monk.party", systemImage: "arrow.up.forward.app")
             }
@@ -1986,11 +2152,23 @@ struct SettingsView: View {
                         .buttonStyle(.bordered).controlSize(.small)
                 }
 
+                HStack(spacing: 6) {
+                    Text("本机 Key").font(.caption.weight(.medium)).frame(width: 55, alignment: .leading)
+                    SecureField("选填 · sk-monk-… · 只用于连通性测试", text: $model.apiKey)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(.body, design: .monospaced))
+                    Button("粘贴") { model.pasteApiKey() }
+                        .buttonStyle(.bordered).controlSize(.small)
+                }
+
                 HStack {
                     if let err = model.validationError {
                         Text(err).font(.caption2).foregroundStyle(.red)
                     } else {
-                        Text("现支持纯邮箱查询。若有多张卡，可在上方直接点击切换。").font(.caption2).foregroundStyle(.secondary)
+                        Text("只需下单邮箱。查询结果只有 Key 末四位；完整密钥在购买邮件，填在「本机 Key」后才能 Ping。多张有效卡可在上方切换。月卡支付宝 ¥30 / 30 天，或 Stripe $5 / 30 天，教育邮箱（含 edu）九折。")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
                     Spacer()
                 }
@@ -2052,7 +2230,10 @@ struct SettingsView: View {
     // MARK: - 底部操作栏
     private var bottomActionBar: some View {
         HStack(spacing: 12) {
-            Button("官网 ↗") { NSWorkspace.shared.open(Cfg.accountPage) }
+            Button("账户页 ↗") { model.openPricing() }
+                .buttonStyle(.link).font(.caption)
+
+            Button("帮助中心 ↗") { model.openHelp() }
                 .buttonStyle(.link).font(.caption)
 
             Button("使用倡议书 ↗") { model.openCharter() }
@@ -2080,10 +2261,7 @@ struct SettingsView: View {
         .background(Color(NSColor.windowBackgroundColor))
     }
 
-    private func masked(_ key: String) -> String {
-        guard key.count > 12 else { return key }
-        return key.prefix(7) + "••••••••" + key.suffix(4)
-    }
+    private func masked(_ key: String) -> String { maskedKey(key) }
 
     private func parseDaysHours(_ ms: Double?) -> (days: Int, hours: Int) {
         guard let ms = ms, ms > 0 else { return (0, 0) }
@@ -2175,9 +2353,15 @@ func cliExit(_ cfg: Config?, wantJSON: Bool) -> Int32 {
             code = (200...299).contains(status) ? 0 : 1
             return
         }
-        guard let root = try? JSONDecoder().decode(Root.self, from: body), let o = root.order else {
-            let msg = (try? JSONDecoder().decode(Root.self, from: body))?.error ?? "HTTP \(status)"
+        guard let root = try? JSONDecoder().decode(Root.self, from: body), let o = root.order, root.success == true, (200...299).contains(status) else {
+            let decoded = try? JSONDecoder().decode(Root.self, from: body)
+            let msg = lookupFailureMessage(status: status, error: decoded?.error)
             FileHandle.standardError.write("monk 查询失败：\(msg)\n".data(using: .utf8)!)
+            code = 1
+            return
+        }
+        if o.status != "paid" {
+            FileHandle.standardError.write("monk 查询失败：订单尚未完成支付。\n".data(using: .utf8)!)
             code = 1
             return
         }
@@ -2200,30 +2384,43 @@ func expect(_ cond: Bool, _ msg: String) {
 }
 
 func selfCheck() {
+    // 形状对齐 2026-10 账户页：只给 apiKeyMasked，dailyLimit 200，四窗口上限见 llms-full.txt。
+    // money 用数字、并带 referral，确认多余字段不会让整包解码失败。
     let fixture = """
-    {"success":true,"order":{
-      "apiKey":"monk-abcdefgh1234","tradeNo":"MK123","status":"paid",
+    {"success":true,"keys":[
+      {"tradeNo":"MK123","apiKeyMasked":"sk-monk-••••abcd","expired":false,"keyActive":true,"remainingMs":1094400000,"latest":true},
+      {"tradeNo":"MK999","apiKeyMasked":"••••9999","expired":true,"remainingMs":0,"latest":false}
+    ],"order":{
+      "apiKeyMasked":"sk-monk-••••abcd","tradeNo":"MK123","status":"paid",
+      "paidAt":"2026-08-29T14:26:24.139Z",
       "expiresAt":"2026-09-28T14:26:24.139Z","remainingMs":1094400000,
       "expired":false,"soon":false,"keyActive":true,
-      "dailyCost":0.4,"dailyLimit":30.0,
+      "dailyCost":0.4,"dailyLimit":200,
+      "money":30,
       "tokens":{"prompt":1200000,"completion":30000,"total":1230000},
-      "fairness":{"hourMax":60,"hourPrompt":30000000,"sixHourMax":200,"sixHourPrompt":120000000,
-                  "inflightPerKey":2,"inflightGlobal":8,"burstCapacity":20,"burstRefillPerMin":8,
-                  "penalty429PerMin":20,"penaltyMinutes":15},
+      "fairness":{"hourMax":800,"hourPrompt":60000000,"sixHourMax":2400,"sixHourPrompt":90000000,
+                  "inflightPerKey":5,"inflightGlobal":60,"burstCapacity":80,"burstRefillPerMin":30,
+                  "penalty429PerMin":40,"penaltyMinutes":8},
       "rateLimit":{"limited":false,"hour":{"w":3,"pin":120000},"six":{"w":12,"pin":1400000}},
       "cooldownUntil":"2026-10-01T00:00:00Z"
-    }}
+    },"referral":{"enabled":true,"url":"https://monk.party/?ref=abc"}}
     """
     let root: Root
     do { root = try JSONDecoder().decode(Root.self, from: Data(fixture.utf8)) }
     catch { fail("decode: \(error)") }
     guard let o = root.order else { fail("no order") }
 
-    expect(o.apiKey == "monk-abcdefgh1234", "apiKey")
-    expect(o.dailyCost == 0.4 && o.dailyLimit == 30, "daily")
+    expect(o.apiKey == nil, "full key absent")
+    expect(o.apiKeyMasked == "sk-monk-••••abcd", "masked key")
+    expect(o.displayKey == "sk-monk-••••abcd", "display key")
+    expect(o.dailyCost == 0.4 && o.dailyLimit == 200, "daily")
     expect(o.rateLimit?.hour?.w == 3 && o.rateLimit?.six?.pin == 1_400_000, "rate windows")
-    expect(o.fairness?.inflightGlobal == 8, "fairness")
+    expect(o.fairness?.hourMax == 800 && o.fairness?.sixHourMax == 2_400, "fairness calls")
+    expect(o.fairness?.hourPrompt == 60_000_000 && o.fairness?.sixHourPrompt == 90_000_000, "fairness tokens")
+    expect(o.fairness?.inflightPerKey == 5 && o.fairness?.inflightGlobal == 60, "inflight")
+    expect(o.fairness?.penalty429PerMin == 40 && o.fairness?.penaltyMinutes == 8, "penalty")
     expect(o.remainingMs == 1_094_400_000, "remainingMs")
+    expect(usableKeys(root.keys ?? []).compactMap(\.tradeNo) == ["MK123"], "usable keys")
     // 缺字段容错（服务端不返 fairness 时不应整体解码失败）
     let sparse = try! JSONDecoder().decode(Root.self, from: Data(#"{"success":true,"order":{"apiKey":"k"}}"#.utf8))
     expect(sparse.order?.fairness == nil, "sparse order")
@@ -2259,8 +2456,9 @@ func selfCheck() {
     expect(state(paid).label.hasPrefix("限流中"), "state limited")
     paid.expired = true
     expect(state(paid).label == "已停用", "state expired")
-    expect(summaryLine(o).contains("今日 ¥0.40/¥30.0"), "summary daily")
-    expect(summaryLine(o).contains("1h 3/60 次"), "summary hour window")
+    expect(summaryLine(o).contains("今日 ¥0.40/¥200.0"), "summary daily")
+    expect(summaryLine(o).contains("1h 3/800 次"), "summary hour window")
+    expect(summaryLine(o).contains("近 14 天 1.23M"), "summary tokens")
     expect(summaryLine(o).contains("约 12 天 16 小时"), "summary remaining")
 
     // 状态栏三种显示模式自检
@@ -2287,6 +2485,43 @@ func selfCheck() {
     expect(isExpiringSoon(longOrder) == true, "expiring soon 2d")
 
     expect(!SystemInfo.macOSName.isEmpty, "macOSName non-empty")
+    expect(SystemInfo.marketingName(major: 27, minor: 0) == "macOS Golden Gate (27.0)", "golden gate")
+    expect(SystemInfo.marketingName(major: 26, minor: 2) == "macOS Tahoe (26.2)", "tahoe")
+    expect(SystemInfo.marketingName(major: 15, minor: 1).hasPrefix("macOS Sequoia"), "sequoia")
+
+    let legacy = try! JSONDecoder().decode(Root.self, from: Data(
+        #"{"success":true,"order":{"apiKey":"sk-monk-abcdefgh1234","dailyLimit":30,"fairness":{"hourMax":60,"inflightGlobal":8}}}"#.utf8
+    ))
+    expect(legacy.order?.apiKey == "sk-monk-abcdefgh1234", "legacy key")
+    expect(isFullKey(legacy.order?.apiKey) == "sk-monk-abcdefgh1234", "legacy full")
+    expect(legacy.order?.dailyLimit == 30 && legacy.order?.fairness?.hourMax == 60, "legacy caps still decode")
+
+    expect(isFullKey("  Bearer sk-monk-abcdefgh1234 ") == "sk-monk-abcdefgh1234", "bearer strip")
+    expect(isFullKey("sk-monk-••••abcd") == nil, "mask is not a key")
+    expect(isFullKey("monk-abcdefgh1234") == "monk-abcdefgh1234", "legacy prefix")
+    expect(isFullKey("sk-other-abcdefgh") == nil, "foreign prefix")
+    expect(maskedKey("sk-monk-abcdefgh1234") == "sk-monk-…1234", "mask full")
+    expect(maskedKey("sk-monk-••••abcd") == "sk-monk-••••abcd", "mask keep server")
+    expect(maskedKey(nil) == "sk-monk-••••", "mask nil")
+
+    expect(lookupFailureMessage(status: 404, error: "No matching order.") == "未查到该邮箱的已支付订单。", "404 zh")
+    expect(lookupFailureMessage(status: 429, error: nil).contains("频繁"), "429 zh")
+
+    expect(MonkCatalog.options.map(\.name) == ["monk", "monk-fast", "monk-coding", "monk-free"], "models")
+    expect(MonkCatalog.baseURL == "https://monk.party/v1", "base url")
+    expect(MonkLimits.daily == 200 && MonkLimits.hourMax == 800 && MonkLimits.sixHourMax == 2_400, "published call caps")
+    expect(MonkLimits.hourPrompt == 60_000_000 && MonkLimits.sixHourPrompt == 90_000_000, "published token caps")
+
+    let link = Cfg.accountURL(email: "you@example.com", tradeNo: "MK123")
+    expect(link.host == "monk.party", "acct host")
+    expect(link.path.hasPrefix("/account"), "acct path")
+    expect(link.query?.contains("trade=MK123") == true, "acct trade")
+    expect(link.query?.contains("email=") == true, "acct email")
+
+    expect(AppMeta.version == "1.6.0", "app version")
+    expect(UpdateChecker.isNewer(latest: "v1.6.0", current: "1.5.0"), "semver newer")
+    expect(!UpdateChecker.isNewer(latest: "1.6.0", current: "1.6.0"), "semver same")
+    expect(!UpdateChecker.isNewer(latest: "v1.5.0", current: "1.6.0"), "semver older")
 
     print("selfcheck ok")
 }
