@@ -1,5 +1,8 @@
 #!/bin/bash
-# 编译 + 打包 Monk 用量.app（Universal 2 架构，原生支持 macOS 13 至 macOS Tahoe 27+）
+# 编译 + 打包 Monk 用量.app
+# Universal 2：arm64 + x86_64，部署目标 macOS 13。
+# macOS 26 Tahoe 仍支持 Intel；macOS 27 Golden Gate 仅 Apple 芯片，使用其中的 arm64 切片。
+# CFBundleShortVersionString 需与 main.swift 里的 AppMeta.version 保持一致。
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -19,7 +22,7 @@ cp build/AppIcon.icns "$RES/AppIcon.icns"
 cp build/AppIcon_128.png "$RES/AppIcon_128.png"
 
 # 3. 编译跨架构 Universal 2 二进制 (arm64 + x86_64)
-# 支持 Apple Silicon (M1/M2/M3/M4/M5) 与 Intel，原生兼容 macOS 13+ 至 macOS Tahoe (macOS 27+)
+# Apple 芯片与 Intel（macOS 13–26）。macOS 27 Golden Gate 只跑 arm64 切片。
 echo "编译 Universal 2 通用二进制 (arm64 + x86_64)..."
 swiftc -target arm64-apple-macos13.0 -O -o "/tmp/monk-arm64" main.swift
 swiftc -target x86_64-apple-macos13.0 -O -o "/tmp/monk-x86_64" main.swift
@@ -37,8 +40,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>CFBundleName</key><string>Monk 用量</string>
   <key>CFBundleDisplayName</key><string>Monk 用量</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>
-  <key>CFBundleShortVersionString</key><string>1.5.0</string>
-  <key>CFBundleVersion</key><string>150</string>
+  <key>CFBundleShortVersionString</key><string>1.6.0</string>
+  <key>CFBundleVersion</key><string>160</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>LSMinimumSystemVersion</key><string>13.0</string>
   <key>LSUIElement</key><true/>
@@ -59,7 +62,8 @@ codesign --force --sign - "$APP" >/dev/null 2>&1 || true
 
 echo
 echo "✓ 已成功构建并打包 Universal 2 应用：$APP"
-echo "  - 架构：Universal 2 (arm64 + x86_64)，原生适配 macOS Tahoe (macOS 27) 及早期版本"
+echo "  - 版本：1.6.0"
+echo "  - 架构：Universal 2 (arm64 + x86_64)。macOS 13–26 含 Intel；macOS 27 Golden Gate 使用 arm64"
 echo "  - 图标：根据 monk.party 冥想火焰与 Apple HIG 设计，已内嵌 AppIcon.icns"
 echo "  - 状态栏：内嵌 18x18 矢量自适应模板图标，支持 ⌘-Drag 自定义排列与防抖等宽排版"
 echo "  - 设置界面：SwiftUI 原生 Bento Grid 风格，支持即时配置与查看限流状态"
