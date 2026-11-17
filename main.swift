@@ -11,7 +11,7 @@
 //  用量接口与官网账户页相同：POST https://monk.party/monk-api/lookup-order
 //  body {"email":..}，多卡时再带 {"tradeNo":..}。
 //  2026-10 起响应只给 Key 末四位（apiKeyMasked），完整 sk-monk-* 在购买邮件里。
-//  付费 Key 可调用 monk / monk-fast / monk-coding / monk-free。Base URL https://monk.party/v1。
+//  付费 Key 可调用 monk / monk-fast / monk-coding / monk-free / monk-opus（Opus 钱包按量）。Base URL https://monk.party/v1。
 //  自动刷新默认关闭，手动 ⌘R。
 //
 
@@ -111,16 +111,17 @@ enum MonkCatalog {
         MonkModelOption(name: "monk-fast", blurb: "极速"),
         MonkModelOption(name: "monk-coding", blurb: "代码"),
         MonkModelOption(name: "monk-free", blurb: "均可"),
+        MonkModelOption(name: "monk-opus", blurb: "钱包"),
     ]
 }
 
 enum MonkLimits {
-    /// 公开默认值，见 2026-10-14 llms-full.txt。服务端 fairness / dailyLimit 一律优先。
+    /// 公开默认值，与服务端 DEFAULT_FAIRNESS 对齐（2026-11-17 公平计数改为 1:1 后）。服务端 fairness / dailyLimit 一律优先。
     static let daily = 200.0
-    static let hourMax = 800.0
-    static let hourPrompt = 60_000_000.0
-    static let sixHourMax = 2_400.0
-    static let sixHourPrompt = 90_000_000.0
+    static let hourMax = 480.0
+    static let hourPrompt = 20_000_000.0
+    static let sixHourMax = 1_600.0
+    static let sixHourPrompt = 55_000_000.0
 }
 
 /// 购买邮件里的完整 Key。掩码（含 •）和空串都不当成可调用密钥。
@@ -943,7 +944,7 @@ final class Agent: NSObject, NSMenuDelegate {
         }
         menu.addItem(info("今日　\(Fmt.bar(o.dailyCost, o.dailyLimit)) \(Fmt.money(o.dailyCost)) / \(Fmt.money(o.dailyLimit))"))
         menu.addItem(info("近14天　\(Fmt.tok(o.tokens?.total)) (入 \(Fmt.tok(o.tokens?.prompt)) · 出 \(Fmt.tok(o.tokens?.completion)))"))
-        menu.addItem(info("模型　monk · monk-fast · monk-coding · monk-free"))
+        menu.addItem(info("模型　monk · monk-fast · monk-coding · monk-free · monk-opus"))
 
         if let r = o.rateLimit, let fair = o.fairness {
             menu.addItem(.separator())
@@ -1915,13 +1916,13 @@ struct SettingsView: View {
                         HStack(alignment: .top, spacing: 12) {
                             VStack(alignment: .leading, spacing: 4) {
                                 Text("1 小时窗口").font(.caption2.weight(.semibold))
-                                RateLimitRow(title: "加权请求", current: r.hour?.w ?? 0, maxVal: fair.hourMax ?? MonkLimits.hourMax, isToken: false)
+                                RateLimitRow(title: "请求次数", current: r.hour?.w ?? 0, maxVal: fair.hourMax ?? MonkLimits.hourMax, isToken: false)
                                 RateLimitRow(title: "输入 Token", current: r.hour?.pin ?? 0, maxVal: fair.hourPrompt ?? MonkLimits.hourPrompt, isToken: true)
                             }
                             Divider().frame(height: 50)
                             VStack(alignment: .leading, spacing: 4) {
                                 Text("6 小时窗口").font(.caption2.weight(.semibold))
-                                RateLimitRow(title: "加权请求", current: r.six?.w ?? 0, maxVal: fair.sixHourMax ?? MonkLimits.sixHourMax, isToken: false)
+                                RateLimitRow(title: "请求次数", current: r.six?.w ?? 0, maxVal: fair.sixHourMax ?? MonkLimits.sixHourMax, isToken: false)
                                 RateLimitRow(title: "输入 Token", current: r.six?.pin ?? 0, maxVal: fair.sixHourPrompt ?? MonkLimits.sixHourPrompt, isToken: true)
                             }
                         }
@@ -1931,7 +1932,7 @@ struct SettingsView: View {
                             ruleCapsule(icon: "archivebox.fill", text: "突发桶: \(Fmt.num(fair.burstCapacity)) / 补 \(Fmt.num(fair.burstRefillPerMin))")
                             ruleCapsule(icon: "shield.fill", text: "超 \(Fmt.num(fair.penalty429PerMin))次 429 罚 \(Fmt.num(fair.penaltyMinutes))分")
                         }
-                        Text("权重：普通请求计 1；输入超过 3.2 万 Token 计 2；超过 8 万计 4。数字以本次查询返回为准。")
+                        Text("每个请求计 1 次（已取消按输入量加权）；数字以本次查询返回为准。")
                             .font(.system(size: 9))
                             .foregroundStyle(.tertiary)
                             .fixedSize(horizontal: false, vertical: true)
@@ -2507,10 +2508,10 @@ func selfCheck() {
     expect(lookupFailureMessage(status: 404, error: "No matching order.") == "未查到该邮箱的已支付订单。", "404 zh")
     expect(lookupFailureMessage(status: 429, error: nil).contains("频繁"), "429 zh")
 
-    expect(MonkCatalog.options.map(\.name) == ["monk", "monk-fast", "monk-coding", "monk-free"], "models")
+    expect(MonkCatalog.options.map(\.name) == ["monk", "monk-fast", "monk-coding", "monk-free", "monk-opus"], "models")
     expect(MonkCatalog.baseURL == "https://monk.party/v1", "base url")
-    expect(MonkLimits.daily == 200 && MonkLimits.hourMax == 800 && MonkLimits.sixHourMax == 2_400, "published call caps")
-    expect(MonkLimits.hourPrompt == 60_000_000 && MonkLimits.sixHourPrompt == 90_000_000, "published token caps")
+    expect(MonkLimits.daily == 200 && MonkLimits.hourMax == 480 && MonkLimits.sixHourMax == 1_600, "published call caps")
+    expect(MonkLimits.hourPrompt == 20_000_000 && MonkLimits.sixHourPrompt == 55_000_000, "published token caps")
 
     let link = Cfg.accountURL(email: "you@example.com", tradeNo: "MK123")
     expect(link.host == "monk.party", "acct host")
