@@ -9,7 +9,7 @@
 
 > 倡导理念：[《Monk 使用倡议书》](https://monk.party/charter/) · [产品介绍](PRODUCT.md) · [帮助中心](https://monk.party/help/)
 
-当前服务（2026-10）：Base URL `https://monk.party/v1`。付费 Key（`sk-monk-*`）可调用 `monk`、`monk-fast`、`monk-coding`、`monk-free`。月卡支付宝 ¥30 / 30 天，或 Stripe $5 / 30 天；下单邮箱域名含 `edu` 九折。用量在 [账户页](https://monk.party/account/) 用下单邮箱查询，完整 Key 只在购买邮件里。
+当前服务（2026-11）：Base URL `https://monk.party/v1`。付费 Key（`sk-monk-*`）可调用 `monk`、`monk-fast`、`monk-coding`、`monk-free`，以及 `monk-opus`（Claude Opus 5.5，走 Opus 钱包按量计费）。月卡支付宝 ¥30 / 30 天，或 Stripe $5 / 30 天；下单邮箱域名含 `edu` 九折。用量在 [账户页](https://monk.party/account/) 用下单邮箱查询，完整 Key 只在购买邮件里。
 
 ---
 
@@ -17,7 +17,7 @@
 
 1. **邮箱即查 & 多卡切换**：与官网账户页同一接口，只提交下单邮箱；名下多张未过期的卡会在看板顶部切换。
 2. **状态栏三档显示**：详细（`¥0.00 (0%) · 25d`）、紧凑（`¥0.00`）、仅图标（极简）。今日内部计量的上限以接口返回为准（公开默认 200，UTC 00:00 清零）。
-3. **Bento 看板**：今日内部计量、有效期、近 14 天 Token、1 小时 / 6 小时加权次数与输入 Token。
+3. **Bento 看板**：今日内部计量、有效期、近 14 天 Token、1 小时 / 6 小时请求次数与输入 Token。
 4. **连通性诊断 (Ping)**：用本机保存的完整 Key 探测 `monk-fast`。查询接口不再下发完整 Key。
 5. **临期提醒**：不足 3 天或已到期时提示，续费入口打开账户页（同一把 Key 顺延 30 天）。
 6. **原生剪贴板**：输入框支持 `⌘C` / `⌘V` / `⌘A`，自带复制与粘贴。

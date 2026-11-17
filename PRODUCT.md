@@ -7,7 +7,7 @@
 
 ## 为什么有 MonkBar？
 
-[Monk](https://monk.party/) 是面向编码 Agent 的 OpenAI 兼容融合接口。付费 Key（`sk-monk-*`）可以调用四条融合模型：`monk`（默认，质量优先）、`monk-fast`（更快的日常对话）、`monk-coding`（编码 / Agent）、`monk-free`（每把付费 Key 都能用）。Base URL 是 `https://monk.party/v1`。
+[Monk](https://monk.party/) 是面向编码 Agent 的 OpenAI 兼容融合接口。付费 Key（`sk-monk-*`）可以调用五条融合模型：`monk`（默认，多模型池）、`monk-fast`（更快的日常对话）、`monk-coding`（编码 / Agent）、`monk-free`（每把付费 Key 都能用），以及 `monk-opus`（Claude Opus 5.5，走 Opus 钱包按量计费）。Base URL 是 `https://monk.party/v1`。
 
 月卡支付宝 ¥30 / 30 天，或 Stripe $5 / 30 天。下单邮箱域名含 `edu` 时九折（支付宝 ¥27，Stripe $4.50）。
 
@@ -21,9 +21,9 @@
 
 - **内部计量**：当日 `dailyCost / dailyLimit`，超过八成变红，UTC 00:00 清零。
 - **临期**：不足 3 天时状态栏出现 `⚠︎`。续费打开 [账户页](https://monk.party/account/)，在原到期日后续 30 天，Key 不变。
-- **双窗口**：1 小时与 6 小时的加权次数、输入 Token。普通请求权重 1，输入超过 3.2 万 Token 计 2，超过 8 万计 4。
+- **双窗口**：1 小时与 6 小时的请求次数、输入 Token。每个请求计 1 次（已取消按输入量加权）。
 - **近 14 天 Token**：输入和输出分开看。
-- **四个模型名**：看板上列出 `monk`、`monk-fast`、`monk-coding`、`monk-free`，避免还按旧的三条来配客户端。
+- **五个模型名**：看板上列出 `monk`、`monk-fast`、`monk-coding`、`monk-free`、`monk-opus`，避免还按旧的三条来配客户端。
 - **Monk-Pi**：终端里 `npx monk-pi`，或 `brew install yaoleifly/tap/monk-pi`。
 - **系统版本**：macOS 13 起可用。26 是 Tahoe，27 是 Golden Gate（仅 Apple 芯片）。
 
