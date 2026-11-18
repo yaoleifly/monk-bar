@@ -777,6 +777,8 @@ final class Agent: NSObject, NSMenuDelegate {
     let fetcher = Fetcher()
     var order: Order?
     var wallet: OpusWallet?
+    /// wallet 属于哪把 Key；换 Key 后旧余额不能继续显示
+    var walletKey: String?
     var note: String?
     var autoRefresh = false
     var displayMode: StatusDisplayMode = .detailed
@@ -843,11 +845,15 @@ final class Agent: NSObject, NSMenuDelegate {
             if let key = fullApiKey(order: self.order) {
                 self.fetcher.opusWallet(apiKey: key) { [weak self] w in
                     guard let self = self else { return }
-                    self.wallet = w ?? self.wallet
+                    if let w {
+                        self.wallet = w
+                        self.walletKey = key
+                    }
                     self.render()
                 }
             } else {
                 self.wallet = nil
+                self.walletKey = nil
             }
         }
     }
@@ -1019,7 +1025,10 @@ final class Agent: NSObject, NSMenuDelegate {
     /// Opus 钱包区块：余额 / 今日已扣 / 日限额；掩码 Key 时给提示。
     func addWalletItems(to menu: NSMenu) {
         if order == nil { return }
-        if let w = wallet, w.hasWallet == true {
+        // 钱包必须属于当前这把 Key，否则（换 Key 后查询失败）不显示
+        let currentKey = fullApiKey(order: order)
+        let walletVisible = wallet != nil && walletKey != nil && walletKey == currentKey
+        if walletVisible, let w = wallet, w.hasWallet == true {
             menu.addItem(.separator())
             menu.addItem(info("💎 Opus 钱包", multiline: false))
             let bal = w.balance ?? 0
@@ -1031,13 +1040,13 @@ final class Agent: NSObject, NSMenuDelegate {
             let topup = NSMenuItem(title: "去充值 Opus 钱包 ↗", action: #selector(doOpenTopup), keyEquivalent: "")
             topup.target = self
             menu.addItem(topup)
-        } else if wallet != nil, wallet?.hasWallet == false {
+        } else if walletVisible, let w = wallet, w.hasWallet == false {
             menu.addItem(.separator())
             menu.addItem(info("💎 Opus 钱包　未开通 · monk-opus 按量付费"))
             let topup = NSMenuItem(title: "开通 Opus 钱包 ↗", action: #selector(doOpenTopup), keyEquivalent: "")
             topup.target = self
             menu.addItem(topup)
-        } else if fullApiKey(order: order) == nil {
+        } else if currentKey == nil {
             menu.addItem(info("💎 Opus 钱包　贴入完整 Key 可查余额（设置页）", multiline: true))
         }
     }
