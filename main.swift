@@ -94,7 +94,7 @@ enum Visuals {
 
 enum AppMeta {
     /// 与 build.sh 里的 CFBundleShortVersionString 保持一致。
-    static let version = "1.8.0"
+    static let version = "1.9.0"
 }
 
 struct MonkModelOption: Identifiable {
@@ -2978,7 +2978,7 @@ func selfCheck() {
     expect(link.query?.contains("trade=MK123") == true, "acct trade")
     expect(link.query?.contains("email=") == true, "acct email")
 
-    expect(AppMeta.version == "1.8.0", "app version")
+    expect(AppMeta.version == "1.9.0", "app version")
     expect(UpdateChecker.isNewer(latest: "v1.6.0", current: "1.5.0"), "semver newer")
     expect(!UpdateChecker.isNewer(latest: "1.6.0", current: "1.6.0"), "semver same")
     expect(!UpdateChecker.isNewer(latest: "v1.5.0", current: "1.6.0"), "semver older")

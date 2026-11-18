@@ -40,7 +40,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>CFBundleName</key><string>Monk 用量</string>
   <key>CFBundleDisplayName</key><string>Monk 用量</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>
-  <key>CFBundleShortVersionString</key><string>1.8.0</string>
+  <key>CFBundleShortVersionString</key><string>1.9.0</string>
   <key>CFBundleVersion</key><string>160</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>LSMinimumSystemVersion</key><string>13.0</string>
@@ -62,7 +62,7 @@ codesign --force --sign - "$APP" >/dev/null 2>&1 || true
 
 echo
 echo "✓ 已成功构建并打包 Universal 2 应用：$APP"
-echo "  - 版本：1.6.0"
+echo "  - 版本：1.9.0"
 echo "  - 架构：Universal 2 (arm64 + x86_64)。macOS 13–26 含 Intel；macOS 27 Golden Gate 使用 arm64"
 echo "  - 图标：根据 monk.party 冥想火焰与 Apple HIG 设计，已内嵌 AppIcon.icns"
 echo "  - 状态栏：内嵌 18x18 矢量自适应模板图标，支持 ⌘-Drag 自定义排列与防抖等宽排版"
