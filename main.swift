@@ -168,6 +168,9 @@ struct Config: Codable {
     var tradeNo: String?
     /// 只留在本机，供连通性测试。用量查询不上传这个字段。
     var apiKey: String?
+    /// 邮箱验证码登录拿到的 monk_session（30 天有效），只存本机 config.json。
+    /// 有它就走 /me/api 会话通道，能查全部订阅、订单、Opus 钱包，不用填卡号。
+    var sessionToken: String?
 }
 
 enum Cfg {
@@ -392,6 +395,7 @@ struct Order: Codable {
     var keyActive: Bool?
     var dailyCost: Double?
     var dailyLimit: Double?
+    var todayRequests: Double?
     var tokens: Tokens?
     var fairness: Fairness?
     var rateLimit: RateLimit?
@@ -400,7 +404,7 @@ struct Order: Codable {
     /// 账户页现在只下发掩码。旧响应若仍带完整 apiKey，显示时再截短。
     var displayKey: String { apiKeyMasked ?? apiKey ?? "sk-monk-••••" }
 
-    init(apiKey: String? = nil, apiKeyMasked: String? = nil, tradeNo: String? = nil, status: String? = nil, createdAt: String? = nil, paidAt: String? = nil, expiresAt: String? = nil, remainingMs: Double? = nil, expired: Bool? = nil, soon: Bool? = nil, keyActive: Bool? = nil, dailyCost: Double? = nil, dailyLimit: Double? = nil, tokens: Tokens? = nil, fairness: Fairness? = nil, rateLimit: RateLimit? = nil, cooldownUntil: String? = nil) {
+    init(apiKey: String? = nil, apiKeyMasked: String? = nil, tradeNo: String? = nil, status: String? = nil, createdAt: String? = nil, paidAt: String? = nil, expiresAt: String? = nil, remainingMs: Double? = nil, expired: Bool? = nil, soon: Bool? = nil, keyActive: Bool? = nil, dailyCost: Double? = nil, dailyLimit: Double? = nil, todayRequests: Double? = nil, tokens: Tokens? = nil, fairness: Fairness? = nil, rateLimit: RateLimit? = nil, cooldownUntil: String? = nil) {
         self.apiKey = apiKey
         self.apiKeyMasked = apiKeyMasked
         self.tradeNo = tradeNo
@@ -414,6 +418,7 @@ struct Order: Codable {
         self.keyActive = keyActive
         self.dailyCost = dailyCost
         self.dailyLimit = dailyLimit
+        self.todayRequests = todayRequests
         self.tokens = tokens
         self.fairness = fairness
         self.rateLimit = rateLimit
@@ -431,6 +436,15 @@ enum MonkEndpoints {
     static let opusKeyInfo = URL(string: "https://monk.party/monk-api/opus/key-info")!
     static let opusTopup = URL(string: "https://monk.party/me/#opus")!
     static let universe = URL(string: "https://universe.monk.party/")!
+
+    // 用户中心 /me/api：邮箱验证码登录 + 会话查询（2026-11 起）
+    static let meBase = "https://monk.party/me/api"
+    static let emailStart = URL(string: meBase + "/auth/email/start")!
+    static let emailVerify = URL(string: meBase + "/auth/email/verify")!
+    static let meOverview = URL(string: meBase + "/me")!
+    static let meOpus = URL(string: meBase + "/opus")!
+    static let meLogout = URL(string: meBase + "/auth/logout")!
+    static let mePage = URL(string: "https://monk.party/me/")!
 }
 
 struct Root: Codable {
@@ -439,6 +453,69 @@ struct Root: Codable {
     var order: Order?
     var error: String?
 }
+
+// MARK: - /me/api 会话模型（邮箱验证码登录后可用）
+
+/// /me/api/me 响应里的单个订阅
+struct MeSub: Codable {
+    var tradeNo: String?
+    var keyMasked: String?
+    var paidAt: String?
+    var expiresAt: String?
+    var remainingMs: Double?
+    var expired: Bool?
+    var soon: Bool?
+    var active: Bool?
+    var disabled: Bool?
+    var cooldownUntil: String?
+    var lastUsed: String?
+    var todayRequests: Double?
+    var todayCost: Double?
+    var dailyLimit: Double?
+    var renewals: Double?
+    var edu: Bool?
+    var payType: String?
+}
+
+struct MeProfile: Codable {
+    var email: String?
+    var name: String?
+}
+
+struct MeWallet: Codable {
+    var exists: Bool?
+    var enabled: Bool?
+    var balance: Double?
+    var status: String?
+    var todayCharged: Double?
+}
+
+/// GET /me/api/me → profile + subs + wallet + 订单/工单概览
+struct MeOverview: Codable {
+    var success: Bool?
+    var error: String?
+    var profile: MeProfile?
+    var subs: [MeSub]?
+    var wallet: MeWallet?
+    var orderCount: Int?
+    var openTickets: Int?
+}
+
+/// GET /me/api/opus → 钱包详情（余额单位已是元）
+struct MeOpus: Codable {
+    var success: Bool?
+    var exists: Bool?
+    var enabled: Bool?
+    var balance: Double?
+    var held: Double?
+    var status: String?
+    var dailyLimit: Double?
+    var todayCharged: Double?
+    var walletKey: String?
+}
+
+/// 会话通道拿到的钱包标记：walletKey 用这个哨兵表示「会话查的钱包属于登录邮箱」
+let sessionWalletKey = "@session"
 
 // MARK: - 网络
 
@@ -518,6 +595,109 @@ final class Fetcher {
             else { done(nil); return }
             done(w)
         }.resume()
+    }
+
+    // MARK: - 邮箱验证码登录（/me/api，与用户中心同一条）
+
+    /// 服务端对 POST 有跨站防护：必须带 x-monk:1 头。
+    private func meRequest(_ url: URL, method: String = "GET", body: [String: Any]? = nil, token: String? = nil) -> URLRequest {
+        var req = URLRequest(url: url)
+        req.httpMethod = method
+        if method != "GET" {
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            req.setValue("1", forHTTPHeaderField: "x-monk")
+            if let body { req.httpBody = try? JSONSerialization.data(withJSONObject: body) }
+        }
+        if let token { req.setValue("monk_session=\(token)", forHTTPHeaderField: "Cookie") }
+        return req
+    }
+
+    /// 发验证码。回调用户可读错误，nil 表示已发出。
+    func sendCode(email: String, completion: @escaping (String?) -> Void) {
+        let req = meRequest(MonkEndpoints.emailStart, method: "POST", body: ["email": email])
+        session.dataTask(with: req) { data, resp, err in
+            DispatchQueue.main.async {
+                if let err { completion("网络错误：\(err.localizedDescription)"); return }
+                guard let http = resp as? HTTPURLResponse, let data else { completion("响应异常"); return }
+                struct R: Codable { var success: Bool?; var error: String? }
+                let r = try? JSONDecoder().decode(R.self, from: data)
+                completion(http.statusCode == 200 && r?.success == true ? nil : (r?.error ?? "发送失败 (HTTP \(http.statusCode))"))
+            }
+        }.resume()
+    }
+
+    /// 校验验证码，成功回调 monk_session token（从 Set-Cookie 提取）。
+    func verifyCode(email: String, code: String, completion: @escaping (String?, String?) -> Void) {
+        let req = meRequest(MonkEndpoints.emailVerify, method: "POST", body: ["email": email, "code": code])
+        session.dataTask(with: req) { data, resp, err in
+            DispatchQueue.main.async {
+                if let err { completion(nil, "网络错误：\(err.localizedDescription)"); return }
+                guard let http = resp as? HTTPURLResponse, let data else { completion(nil, "响应异常"); return }
+                struct R: Codable { var success: Bool?; var error: String? }
+                let r = try? JSONDecoder().decode(R.self, from: data)
+                guard http.statusCode == 200, r?.success == true else {
+                    completion(nil, r?.error ?? "登录失败 (HTTP \(http.statusCode))")
+                    return
+                }
+                let cookie = http.value(forHTTPHeaderField: "Set-Cookie") ?? ""
+                guard let range = cookie.range(of: #"monk_session=([A-Za-z0-9_-]{20,100})"#, options: .regularExpression) else {
+                    completion(nil, "登录成功但没拿到会话，稍后再试")
+                    return
+                }
+                completion(String(cookie[range].dropFirst("monk_session=".count)), nil)
+            }
+        }.resume()
+    }
+
+    /// 会话通道：/me/api/me 拉订阅+钱包+订单概览，/me/api/opus 拉钱包详情。
+    /// 回调 (选中订阅, 全部订阅卡, 钱包, 错误)；401 时错误为 "session_expired"。
+    func meSession(token: String, pickTradeNo: String?, completion: @escaping (Order?, [KeyItem]?, OpusWallet?, String?) -> Void) {
+        let req = meRequest(MonkEndpoints.meOverview, token: token)
+        session.dataTask(with: req) { [weak self] data, resp, err in
+            let done: (Order?, [KeyItem]?, OpusWallet?, String?) -> Void = { o, k, w, e in
+                DispatchQueue.main.async { completion(o, k, w, e) }
+            }
+            if let err { done(nil, nil, nil, "网络错误：\(err.localizedDescription)"); return }
+            guard let http = resp as? HTTPURLResponse, let data else { done(nil, nil, nil, "响应异常"); return }
+            if http.statusCode == 401 { done(nil, nil, nil, "session_expired"); return }
+            guard let ov = try? JSONDecoder().decode(MeOverview.self, from: data), ov.success == true else {
+                done(nil, nil, nil, "无法解析响应 (HTTP \(http.statusCode))")
+                return
+            }
+            let subs = ov.subs ?? []
+            let pick = subs.first(where: { $0.tradeNo == pickTradeNo }) ?? subs.first
+            let order = pick.map { s in
+                Order(apiKeyMasked: s.keyMasked, tradeNo: s.tradeNo, status: "paid", paidAt: s.paidAt,
+                      expiresAt: s.expiresAt, remainingMs: s.remainingMs, expired: s.expired, soon: s.soon,
+                      keyActive: s.active, dailyCost: s.todayCost, dailyLimit: s.dailyLimit,
+                      todayRequests: s.todayRequests, cooldownUntil: s.cooldownUntil)
+            }
+            let keys = subs.map { s in
+                KeyItem(tradeNo: s.tradeNo, apiKeyMasked: s.keyMasked, paidAt: s.paidAt, createdAt: nil,
+                        expiresAt: s.expiresAt, expired: s.expired, keyActive: s.active,
+                        remainingMs: s.remainingMs, soon: s.soon, latest: s.tradeNo == pick?.tradeNo)
+            }
+            // 钱包详情走 /me/api/opus（含 dailyLimit）
+            let opusReq = self?.meRequest(MonkEndpoints.meOpus, token: token)
+            guard let opusReq, let self else { done(order, keys, nil, nil); return }
+            self.session.dataTask(with: opusReq) { d2, r2, _ in
+                var w: OpusWallet? = nil
+                if let d2, let http2 = r2 as? HTTPURLResponse, http2.statusCode == 200,
+                   let m = try? JSONDecoder().decode(MeOpus.self, from: d2), m.success == true {
+                    let bal = m.balance ?? 0
+                    w = OpusWallet(success: true, hasWallet: m.exists, keyKind: nil, balance: m.balance,
+                                   held: m.held, todayCharged: m.todayCharged, dailyLimit: m.dailyLimit,
+                                   low: (m.exists == true && bal < 5), status: m.status)
+                }
+                done(order, keys, w, nil)
+            }.resume()
+        }.resume()
+    }
+
+    /// 退出登录：让服务端吊销会话（不等待结果）。
+    func meLogout(token: String) {
+        let req = meRequest(MonkEndpoints.meLogout, method: "POST", body: [:], token: token)
+        session.dataTask(with: req) { _, _, _ in }.resume()
     }
 }
 
@@ -839,6 +1019,23 @@ final class Agent: NSObject, NSMenuDelegate {
             setOrder(nil, keys: [], note: "未配置：请填写下单邮箱")
             return
         }
+        // 已登录：走 /me/api 会话通道，能查全部订阅 + Opus 钱包
+        if let token = cfg.sessionToken, !token.isEmpty {
+            fetcher.meSession(token: token, pickTradeNo: cfg.tradeNo) { [weak self] o, k, w, e in
+                guard let self = self else { return }
+                if e == "session_expired" {
+                    var c = cfg; c.sessionToken = nil; Cfg.save(c)
+                    self.setOrder(nil, keys: [], note: "登录已过期，请到设置里重新登录")
+                    self.wallet = nil; self.walletKey = nil
+                    return
+                }
+                self.setOrder(o ?? self.order, keys: k ?? self.keys, note: e)
+                self.wallet = w
+                self.walletKey = w != nil ? sessionWalletKey : nil
+                self.render()
+            }
+            return
+        }
         fetcher.lookup(cfg) { [weak self] o, k, e in
             guard let self = self else { return }
             self.setOrder(o ?? self.order, keys: k ?? self.keys, note: e)
@@ -918,6 +1115,9 @@ final class Agent: NSObject, NSMenuDelegate {
             menu.addItem(.separator())
         }
 
+        if let cfg = Cfg.load(), cfg.sessionToken != nil {
+            menu.addItem(info("账号　\(cfg.email)（已登录）"))
+        }
         if let o = order { addOrderItems(to: menu, o) }
         if let note { menu.addItem(info("⚠︎ " + note, multiline: true)) }
         if order == nil && Cfg.load() == nil {
@@ -1006,7 +1206,7 @@ final class Agent: NSObject, NSMenuDelegate {
         if let opened = o.paidAt ?? o.createdAt {
             menu.addItem(info("开通　\(Fmt.date(opened))"))
         }
-        menu.addItem(info("今日　\(Fmt.bar(o.dailyCost, o.dailyLimit)) \(Fmt.money(o.dailyCost)) / \(Fmt.money(o.dailyLimit))"))
+        menu.addItem(info("今日　\(Fmt.bar(o.dailyCost, o.dailyLimit)) \(Fmt.money(o.dailyCost)) / \(Fmt.money(o.dailyLimit))\(o.todayRequests.map { " · \(Int($0)) 次" } ?? "")"))
         menu.addItem(info("近14天　\(Fmt.tok(o.tokens?.total)) (入 \(Fmt.tok(o.tokens?.prompt)) · 出 \(Fmt.tok(o.tokens?.completion)))"))
         menu.addItem(info("订阅　monk · monk-fast · monk-coding · monk-free"))
         menu.addItem(info("按量　monk-opus（Opus 钱包）"))
@@ -1025,9 +1225,9 @@ final class Agent: NSObject, NSMenuDelegate {
     /// Opus 钱包区块：余额 / 今日已扣 / 日限额；掩码 Key 时给提示。
     func addWalletItems(to menu: NSMenu) {
         if order == nil { return }
-        // 钱包必须属于当前这把 Key，否则（换 Key 后查询失败）不显示
+        // 钱包必须属于当前这把 Key（换 Key 后不显示）；登录会话查到的钱包属于登录邮箱，用哨兵标识
         let currentKey = fullApiKey(order: order)
-        let walletVisible = wallet != nil && walletKey != nil && walletKey == currentKey
+        let walletVisible = wallet != nil && walletKey != nil && (walletKey == sessionWalletKey || walletKey == currentKey)
         if walletVisible, let w = wallet, w.hasWallet == true {
             menu.addItem(.separator())
             menu.addItem(info("💎 Opus 钱包", multiline: false))
@@ -1248,6 +1448,15 @@ final class SettingsViewModel: ObservableObject {
     @Published var copiedMonkPiNpx: Bool = false
     @Published var copiedMonkPiBrew: Bool = false
 
+    // 邮箱验证码登录
+    @Published var loginCode: String = ""
+    @Published var sendingCode: Bool = false
+    @Published var codeSent: Bool = false
+    @Published var verifying: Bool = false
+    @Published var loginError: String? = nil
+    @Published var loggedInEmail: String? = nil
+    @Published var resendIn: Int = 0
+
     weak var agent: Agent?
 
     func loadFromCurrent(agent: Agent) {
@@ -1269,6 +1478,81 @@ final class SettingsViewModel: ObservableObject {
         self.copiedTradeNo = false
         self.copiedMonkPiNpx = false
         self.copiedMonkPiBrew = false
+        self.loggedInEmail = (cfg?.sessionToken?.isEmpty == false) ? self.email : nil
+        self.loginError = nil
+    }
+
+    // MARK: - 邮箱验证码登录
+
+    func sendLoginCode() {
+        let e = email.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard e.contains("@"), let fetcher = agent?.fetcher else {
+            loginError = "先填一个有效邮箱"
+            return
+        }
+        sendingCode = true
+        loginError = nil
+        fetcher.sendCode(email: e) { [weak self] err in
+            guard let self else { return }
+            self.sendingCode = false
+            if let err {
+                self.loginError = err
+            } else {
+                self.codeSent = true
+                self.resendIn = 60
+                Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] t in
+                    guard let self, self.resendIn > 0 else { t.invalidate(); return }
+                    self.resendIn -= 1
+                    if self.resendIn <= 0 { t.invalidate() }
+                }
+            }
+        }
+    }
+
+    func verifyLoginCode() {
+        let e = email.trimmingCharacters(in: .whitespacesAndNewlines)
+        let c = loginCode.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard c.count == 6, c.allSatisfy({ $0.isNumber }), let fetcher = agent?.fetcher else {
+            loginError = "填 6 位数字验证码"
+            return
+        }
+        verifying = true
+        loginError = nil
+        fetcher.verifyCode(email: e, code: c) { [weak self] token, err in
+            guard let self else { return }
+            self.verifying = false
+            if let err {
+                self.loginError = err
+                return
+            }
+            guard let token else {
+                self.loginError = "登录失败，稍后再试"
+                return
+            }
+            var cfg = Cfg.load() ?? Config(email: e, tradeNo: nil, apiKey: nil, sessionToken: nil)
+            cfg.email = e
+            cfg.sessionToken = token
+            Cfg.save(cfg)
+            self.loggedInEmail = e
+            self.codeSent = false
+            self.loginCode = ""
+            self.agent?.refreshIfNeeded()
+        }
+    }
+
+    func logout() {
+        if let token = Cfg.load()?.sessionToken, let fetcher = agent?.fetcher {
+            fetcher.meLogout(token: token)
+        }
+        var cfg = Cfg.load()
+        cfg?.sessionToken = nil
+        if let cfg { Cfg.save(cfg) }
+        loggedInEmail = nil
+        codeSent = false
+        loginCode = ""
+        agent?.wallet = nil
+        agent?.walletKey = nil
+        agent?.refreshIfNeeded()
     }
 
     func copyEmail() {
@@ -1403,7 +1687,9 @@ final class SettingsViewModel: ObservableObject {
         } else {
             kept = isFullKey(typed) ?? Cfg.load()?.apiKey
         }
-        Cfg.save(Config(email: email, tradeNo: no, apiKey: kept))
+        // 邮箱与会话绑定：换了邮箱就不能沿用旧 token，否则会拿错账号的数据
+        let keepToken = Cfg.load()?.email.lowercased() == email.lowercased() ? Cfg.load()?.sessionToken : nil
+        Cfg.save(Config(email: email, tradeNo: no, apiKey: kept, sessionToken: keepToken))
         withAnimation { isRefreshing = true }
         agent?.refreshIfNeeded()
     }
@@ -1489,7 +1775,10 @@ final class SettingsViewModel: ObservableObject {
         }
 
         validationError = nil
-        Cfg.save(Config(email: e, tradeNo: t.isEmpty ? nil : t, apiKey: storedKey))
+        // 邮箱变了就丢会话（token 绑定登录时的邮箱），避免把 A 账号的数据贴到 B 账号上
+        let prev = Cfg.load()
+        Cfg.save(Config(email: e, tradeNo: t.isEmpty ? nil : t, apiKey: storedKey, sessionToken: prev?.email.lowercased() == e.lowercased() ? prev?.sessionToken : nil))
+        if prev?.email.lowercased() != e.lowercased() { loggedInEmail = nil }
 
         if let agent = agent {
             if agent.autoRefresh != autoRefresh {
@@ -1705,6 +1994,9 @@ struct SettingsView: View {
 
                     // Monk-Pi 工具
                     monkPiRecommendationCard
+
+                    // 邮箱验证码登录
+                    loginCard
 
                     // 凭据设置
                     credentialsCard
@@ -2274,6 +2566,60 @@ struct SettingsView: View {
                             .fixedSize(horizontal: false, vertical: true)
                     }
                     Spacer()
+                }
+            }
+        }
+    }
+
+    // MARK: - 邮箱登录卡片
+    private var loginCard: some View {
+        MetricCard(title: "Monk 账号", icon: "envelope.badge.person.crop", iconColor: .orange) {
+            VStack(spacing: 8) {
+                if let logged = model.loggedInEmail {
+                    HStack(spacing: 8) {
+                        Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("已登录 \(logged)").font(.caption.weight(.semibold))
+                            Text("可查全部订阅、订单与 Opus 钱包，会话 30 天有效")
+                                .font(.caption2).foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        Button("用户中心 ↗") { NSWorkspace.shared.open(MonkEndpoints.mePage) }
+                            .buttonStyle(.bordered).controlSize(.small)
+                        Button("退出") { model.logout() }
+                            .buttonStyle(.bordered).controlSize(.small)
+                    }
+                } else {
+                    HStack(spacing: 6) {
+                        Text("邮箱").font(.caption.weight(.medium)).frame(width: 55, alignment: .leading)
+                        TextField("your@email.com", text: $model.email).textFieldStyle(.roundedBorder)
+                        Button(model.sendingCode ? "发送中…" : (model.resendIn > 0 ? "\(model.resendIn)s" : "发验证码")) {
+                            model.sendLoginCode()
+                        }
+                        .buttonStyle(.bordered).controlSize(.small)
+                        .disabled(model.sendingCode || model.resendIn > 0 || !model.email.contains("@"))
+                    }
+                    if model.codeSent {
+                        HStack(spacing: 6) {
+                            Text("验证码").font(.caption.weight(.medium)).frame(width: 55, alignment: .leading)
+                            TextField("6 位数字", text: $model.loginCode)
+                                .textFieldStyle(.roundedBorder)
+                                .font(.system(.body, design: .monospaced))
+                            Button(model.verifying ? "登录中…" : "登录") { model.verifyLoginCode() }
+                                .buttonStyle(.borderedProminent).controlSize(.small)
+                                .disabled(model.verifying || model.loginCode.count != 6)
+                        }
+                    }
+                    HStack {
+                        if let err = model.loginError {
+                            Text(err).font(.caption2).foregroundStyle(.red)
+                        } else {
+                            Text(model.codeSent ? "验证码已发到邮箱（看看垃圾邮件）。登录后不用再填卡号。" : "用下单邮箱收验证码登录，登录后菜单直接显示全部订阅与 Opus 钱包。")
+                                .font(.caption2).foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        Spacer()
+                    }
                 }
             }
         }
