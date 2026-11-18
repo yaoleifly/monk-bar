@@ -40,7 +40,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>CFBundleName</key><string>Monk 用量</string>
   <key>CFBundleDisplayName</key><string>Monk 用量</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>
-  <key>CFBundleShortVersionString</key><string>1.7.0</string>
+  <key>CFBundleShortVersionString</key><string>1.8.0</string>
   <key>CFBundleVersion</key><string>160</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>LSMinimumSystemVersion</key><string>13.0</string>
