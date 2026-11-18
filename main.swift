@@ -1687,7 +1687,9 @@ final class SettingsViewModel: ObservableObject {
         } else {
             kept = isFullKey(typed) ?? Cfg.load()?.apiKey
         }
-        Cfg.save(Config(email: email, tradeNo: no, apiKey: kept, sessionToken: Cfg.load()?.sessionToken))
+        // 邮箱与会话绑定：换了邮箱就不能沿用旧 token，否则会拿错账号的数据
+        let keepToken = Cfg.load()?.email.lowercased() == email.lowercased() ? Cfg.load()?.sessionToken : nil
+        Cfg.save(Config(email: email, tradeNo: no, apiKey: kept, sessionToken: keepToken))
         withAnimation { isRefreshing = true }
         agent?.refreshIfNeeded()
     }
@@ -1773,7 +1775,10 @@ final class SettingsViewModel: ObservableObject {
         }
 
         validationError = nil
-        Cfg.save(Config(email: e, tradeNo: t.isEmpty ? nil : t, apiKey: storedKey, sessionToken: Cfg.load()?.sessionToken))
+        // 邮箱变了就丢会话（token 绑定登录时的邮箱），避免把 A 账号的数据贴到 B 账号上
+        let prev = Cfg.load()
+        Cfg.save(Config(email: e, tradeNo: t.isEmpty ? nil : t, apiKey: storedKey, sessionToken: prev?.email.lowercased() == e.lowercased() ? prev?.sessionToken : nil))
+        if prev?.email.lowercased() != e.lowercased() { loggedInEmail = nil }
 
         if let agent = agent {
             if agent.autoRefresh != autoRefresh {
