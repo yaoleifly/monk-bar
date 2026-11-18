@@ -351,6 +351,19 @@ struct Fairness: Codable {
 
 struct Tokens: Codable { var prompt: Double?; var completion: Double?; var total: Double? }
 
+/// GET /monk-api/opus/key-info（2026-11-18 起，sk-monk-* 鉴权）
+struct OpusWallet: Codable {
+    var success: Bool?
+    var hasWallet: Bool?
+    var keyKind: String?
+    var balance: Double?
+    var held: Double?
+    var todayCharged: Double?
+    var dailyLimit: Double?
+    var low: Bool?
+    var status: String?
+}
+
 struct KeyItem: Codable, Identifiable {
     var id: String { tradeNo ?? UUID().uuidString }
     var tradeNo: String?
@@ -412,6 +425,12 @@ struct Order: Codable {
 func fullApiKey(order: Order?) -> String? {
     if let k = isFullKey(order?.apiKey) { return k }
     return isFullKey(Cfg.load()?.apiKey)
+}
+
+enum MonkEndpoints {
+    static let opusKeyInfo = URL(string: "https://monk.party/monk-api/opus/key-info")!
+    static let opusTopup = URL(string: "https://monk.party/me/#opus")!
+    static let universe = URL(string: "https://universe.monk.party/")!
 }
 
 struct Root: Codable {
@@ -481,6 +500,23 @@ final class Fetcher {
             default:
                 main(nil, nil, lookupFailureMessage(status: http.statusCode, error: root.error))
             }
+        }.resume()
+    }
+
+    /// 用完整 sk-monk-* Key 查 Opus 钱包；掩码 Key 无法查询。
+    func opusWallet(apiKey: String, completion: @escaping (OpusWallet?) -> Void) {
+        var req = URLRequest(url: MonkEndpoints.opusKeyInfo)
+        req.httpMethod = "GET"
+        req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        req.setValue("application/json", forHTTPHeaderField: "Accept")
+        session.dataTask(with: req) { data, resp, _ in
+            let done: (OpusWallet?) -> Void = { w in
+                DispatchQueue.main.async { completion(w) }
+            }
+            guard let data, let http = resp as? HTTPURLResponse, http.statusCode == 200,
+                  let w = try? JSONDecoder().decode(OpusWallet.self, from: data), w.success == true
+            else { done(nil); return }
+            done(w)
         }.resume()
     }
 }
@@ -740,6 +776,9 @@ final class Agent: NSObject, NSMenuDelegate {
     let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     let fetcher = Fetcher()
     var order: Order?
+    var wallet: OpusWallet?
+    /// wallet 属于哪把 Key；换 Key 后旧余额不能继续显示
+    var walletKey: String?
     var note: String?
     var autoRefresh = false
     var displayMode: StatusDisplayMode = .detailed
@@ -803,6 +842,19 @@ final class Agent: NSObject, NSMenuDelegate {
         fetcher.lookup(cfg) { [weak self] o, k, e in
             guard let self = self else { return }
             self.setOrder(o ?? self.order, keys: k ?? self.keys, note: e)
+            if let key = fullApiKey(order: self.order) {
+                self.fetcher.opusWallet(apiKey: key) { [weak self] w in
+                    guard let self = self else { return }
+                    if let w {
+                        self.wallet = w
+                        self.walletKey = key
+                    }
+                    self.render()
+                }
+            } else {
+                self.wallet = nil
+                self.walletKey = nil
+            }
         }
     }
 
@@ -868,6 +920,14 @@ final class Agent: NSObject, NSMenuDelegate {
 
         if let o = order { addOrderItems(to: menu, o) }
         if let note { menu.addItem(info("⚠︎ " + note, multiline: true)) }
+        if order == nil && Cfg.load() == nil {
+            menu.addItem(info("三步开始 👇", multiline: true))
+            menu.addItem(info("① 去 monk.party 下单拿 Key（¥30 / 30 天）", multiline: true))
+            menu.addItem(info("② 在这里填入下单邮箱", multiline: true))
+            menu.addItem(info("③ 菜单栏实时看用量与 Opus 钱包", multiline: true))
+            menu.addItem(.separator())
+        }
+        addWalletItems(to: menu)
         menu.addItem(.separator())
 
         let refresh = NSMenuItem(title: "刷新", action: #selector(doRefresh), keyEquivalent: "r")
@@ -904,6 +964,10 @@ final class Agent: NSObject, NSMenuDelegate {
         acct.keyEquivalentModifierMask = [.command, .shift]
         acct.target = self
         menu.addItem(acct)
+
+        let universeItem = NSMenuItem(title: "MONK 宇宙 ↗", action: #selector(doOpenUniverse), keyEquivalent: "")
+        universeItem.target = self
+        menu.addItem(universeItem)
 
         let monkPiItem = NSMenuItem(title: "推荐 Monk-Pi ↗", action: #selector(doOpenMonkPi), keyEquivalent: "")
         monkPiItem.target = self
@@ -944,7 +1008,8 @@ final class Agent: NSObject, NSMenuDelegate {
         }
         menu.addItem(info("今日　\(Fmt.bar(o.dailyCost, o.dailyLimit)) \(Fmt.money(o.dailyCost)) / \(Fmt.money(o.dailyLimit))"))
         menu.addItem(info("近14天　\(Fmt.tok(o.tokens?.total)) (入 \(Fmt.tok(o.tokens?.prompt)) · 出 \(Fmt.tok(o.tokens?.completion)))"))
-        menu.addItem(info("模型　monk · monk-fast · monk-coding · monk-free · monk-opus"))
+        menu.addItem(info("订阅　monk · monk-fast · monk-coding · monk-free"))
+        menu.addItem(info("按量　monk-opus（Opus 钱包）"))
 
         if let r = o.rateLimit, let fair = o.fairness {
             menu.addItem(.separator())
@@ -955,6 +1020,43 @@ final class Agent: NSObject, NSMenuDelegate {
         if let cd = o.cooldownUntil, Fmt.parse(cd)?.timeIntervalSinceNow ?? -1 > 0 {
             menu.addItem(info("冷却　　至 \(Fmt.date(cd))"))
         }
+    }
+
+    /// Opus 钱包区块：余额 / 今日已扣 / 日限额；掩码 Key 时给提示。
+    func addWalletItems(to menu: NSMenu) {
+        if order == nil { return }
+        // 钱包必须属于当前这把 Key，否则（换 Key 后查询失败）不显示
+        let currentKey = fullApiKey(order: order)
+        let walletVisible = wallet != nil && walletKey != nil && walletKey == currentKey
+        if walletVisible, let w = wallet, w.hasWallet == true {
+            menu.addItem(.separator())
+            menu.addItem(info("💎 Opus 钱包", multiline: false))
+            let bal = w.balance ?? 0
+            let today = w.todayCharged ?? 0
+            let limit = w.dailyLimit ?? 0
+            let flag = (w.low == true || bal <= 0) ? " ⚠️ 偏低" : ""
+            menu.addItem(info("余额　\(Fmt.money(bal))\(flag) · 今日已扣 \(Fmt.money(today))"))
+            menu.addItem(info("日限　\(Fmt.bar(today, limit)) \(Fmt.money(today)) / \(Fmt.money(limit))"))
+            let topup = NSMenuItem(title: "去充值 Opus 钱包 ↗", action: #selector(doOpenTopup), keyEquivalent: "")
+            topup.target = self
+            menu.addItem(topup)
+        } else if walletVisible, let w = wallet, w.hasWallet == false {
+            menu.addItem(.separator())
+            menu.addItem(info("💎 Opus 钱包　未开通 · monk-opus 按量付费"))
+            let topup = NSMenuItem(title: "开通 Opus 钱包 ↗", action: #selector(doOpenTopup), keyEquivalent: "")
+            topup.target = self
+            menu.addItem(topup)
+        } else if currentKey == nil {
+            menu.addItem(info("💎 Opus 钱包　贴入完整 Key 可查余额（设置页）", multiline: true))
+        }
+    }
+
+    @objc func doOpenTopup() {
+        NSWorkspace.shared.open(MonkEndpoints.opusTopup)
+    }
+
+    @objc func doOpenUniverse() {
+        NSWorkspace.shared.open(MonkEndpoints.universe)
     }
 
     func masked(_ key: String?) -> String { maskedKey(key) }
@@ -2510,6 +2612,17 @@ func selfCheck() {
 
     expect(MonkCatalog.options.map(\.name) == ["monk", "monk-fast", "monk-coding", "monk-free", "monk-opus"], "models")
     expect(MonkCatalog.baseURL == "https://monk.party/v1", "base url")
+
+    let walletFixture = """
+    {"success":true,"hasWallet":true,"keyKind":"wallet","balance":9.95,"held":0.5,
+     "todayCharged":0.04,"dailyLimit":10,"low":false,"status":"active","currency":"CNY"}
+    """
+    let w = try! JSONDecoder().decode(OpusWallet.self, from: Data(walletFixture.utf8))
+    expect(w.hasWallet == true && w.balance == 9.95 && w.dailyLimit == 10, "opus wallet decode")
+    let noWallet = try! JSONDecoder().decode(OpusWallet.self, from: Data(
+        #"{"success":true,"hasWallet":false,"keyKind":"subscription","balance":0,"dailyLimit":10,"low":false}"#.utf8
+    ))
+    expect(noWallet.hasWallet == false && noWallet.balance == 0, "opus no-wallet decode")
     expect(MonkLimits.daily == 200 && MonkLimits.hourMax == 480 && MonkLimits.sixHourMax == 1_600, "published call caps")
     expect(MonkLimits.hourPrompt == 20_000_000 && MonkLimits.sixHourPrompt == 55_000_000, "published token caps")
 

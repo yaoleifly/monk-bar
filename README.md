@@ -19,11 +19,13 @@
 2. **状态栏三档显示**：详细（`¥0.00 (0%) · 25d`）、紧凑（`¥0.00`）、仅图标（极简）。今日内部计量的上限以接口返回为准（公开默认 200，UTC 00:00 清零）。
 3. **Bento 看板**：今日内部计量、有效期、近 14 天 Token、1 小时 / 6 小时请求次数与输入 Token。
 4. **连通性诊断 (Ping)**：用本机保存的完整 Key 探测 `monk-fast`。查询接口不再下发完整 Key。
-5. **临期提醒**：不足 3 天或已到期时提示，续费入口打开账户页（同一把 Key 顺延 30 天）。
-6. **原生剪贴板**：输入框支持 `⌘C` / `⌘V` / `⌘A`，自带复制与粘贴。
-7. **推荐生态**：内置 [Monk-Pi](https://github.com/yaoleifly/monk-pi) 的 `npx` 与 Homebrew 命令。
-8. **检查更新**：启动时比对 GitHub Release，可手动检查，也可关掉。
-9. **状态栏图标**：18×18 模板图标，支持 `⌘-Drag` 拖拽排序。
+5. **Opus 钱包**：本机存了完整 `sk-monk-*` Key 时，菜单显示余额、今日已扣、日限额与低余额提醒，一键去充值；只有掩码 Key 时会提示贴入完整 Key。
+6. **MONK 宇宙**：菜单里一键打开宇宙站，看全部服务星球。
+7. **临期提醒**：不足 3 天或已到期时提示，续费入口打开账户页（同一把 Key 顺延 30 天）。
+8. **原生剪贴板**：输入框支持 `⌘C` / `⌘V` / `⌘A`，自带复制与粘贴。
+9. **推荐生态**：内置 [Monk-Pi](https://github.com/yaoleifly/monk-pi) 的 `npx` 与 Homebrew 命令。
+10. **检查更新**：启动时比对 GitHub Release，可手动检查，也可关掉。
+11. **状态栏图标**：18×18 模板图标，支持 `⌘-Drag` 拖拽排序。
 
 ---
 
@@ -61,7 +63,7 @@ open build/MonkUsage.app
 
 - 凭据只写在本机 `~/Library/Application Support/MonkUsage/config.json`，不会上报。
 - 用量查询只提交邮箱，以及可选的订单号：`POST https://monk.party/monk-api/lookup-order`。
-- 完整 Key 不是查询结果的一部分。若要在菜单栏里测连通性，把购买邮件中的 `sk-monk-…` 填进「本机 Key」，或设置环境变量 `MONK_API_KEY`。这个值只用于发往 `https://monk.party/v1/chat/completions` 的探测，不会放进用量查询。
+- 完整 Key 不是查询结果的一部分。若要在菜单栏里测连通性、查看 Opus 钱包，把购买邮件中的 `sk-monk-…` 填进「本机 Key」，或设置环境变量 `MONK_API_KEY`。这个值只用于发往 `https://monk.party` 的探测（`chat/completions` 与 `opus/key-info`），不会放进用量查询。
 - 也可用 `MONK_EMAIL`、`MONK_TRADENO` 注入邮箱和订单号。
 - 默认手动刷新（`⌘R`）。打开后台刷新后间隔 5 分钟；响应若带 ETag，未变化时走 304。
 

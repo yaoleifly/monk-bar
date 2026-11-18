@@ -24,6 +24,8 @@
 - **双窗口**：1 小时与 6 小时的请求次数、输入 Token。每个请求计 1 次（已取消按输入量加权）。
 - **近 14 天 Token**：输入和输出分开看。
 - **五个模型名**：看板上列出 `monk`、`monk-fast`、`monk-coding`、`monk-free`、`monk-opus`，避免还按旧的三条来配客户端。
+- **Opus 钱包**：本机有完整 `sk-monk-*` Key 时调 `/monk-api/opus/key-info` 显示余额 / 今日已扣 / 日限额，低余额标 ⚠️，一键去充值；未开通钱包时给「开通」入口；只有掩码 Key 时提示去设置页贴完整 Key。
+- **开箱即用**：未配置邮箱时菜单直接给「三步开始」引导（下单 → 填邮箱 → 看用量），并自动弹设置窗。
 - **Monk-Pi**：终端里 `npx monk-pi`，或 `brew install yaoleifly/tap/monk-pi`。
 - **系统版本**：macOS 13 起可用。26 是 Tahoe，27 是 Golden Gate（仅 Apple 芯片）。
 
