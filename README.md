@@ -9,7 +9,7 @@
 
 > 倡导理念：[《Monk 使用倡议书》](https://monk.party/charter/) · [产品介绍](PRODUCT.md) · [帮助中心](https://monk.party/help/)
 
-当前服务（2026-11）：Base URL `https://monk.party/v1`。付费 Key（`sk-monk-*`）可调用 `monk`、`monk-fast`、`monk-coding`、`monk-free`，以及 `monk-opus`（Claude Opus 5.5，走 Opus 钱包按量计费）。月卡支付宝 ¥30 / 30 天，或 Stripe $5 / 30 天；下单邮箱域名含 `edu` 九折。用量在 [账户页](https://monk.party/account/) 用下单邮箱查询，完整 Key 只在购买邮件里。
+当前服务（2026-11）：Base URL `https://monk.party/v1`。付费 Key（`sk-monk-*`）可调用 `monk`、`monk-fast`、`monk-coding`、`monk-free`，以及 `monk-opus`（Claude Opus 5.5，走 Opus 钱包按量计费）。月卡支付宝 ¥30 / 30 天，或 Stripe $5 / 30 天；下单邮箱域名含 `edu` 九折。用量在 [用户中心](https://monk.party/me/) 用下单邮箱登录查看（旧 /account 链接自动跳转），完整 Key 只在购买邮件里。
 
 ---
 
@@ -68,6 +68,14 @@ open build/MonkUsage.app
 - 默认手动刷新（`⌘R`）。打开后台刷新后间隔 5 分钟；响应若带 ETag，未变化时走 304。
 
 ---
+
+## 🔗 MONK 宇宙 · 相关项目
+
+- [monk.party](https://monk.party/) — OpenAI 兼容融合 API 总站：[月卡 ¥30/30 天](https://monk.party/) · [Monk Opus](https://monk.party/opus/)（Claude Opus 5.5 按量，约官方价 3 折）· [在线试用](https://monk.party/try/) · [用户中心](https://monk.party/me/)
+- [monk-pi](https://github.com/yaoleifly/monk-pi) — 推荐 CLI：Pi Coding Agent × Monk 零配置
+- [monk-harness](https://github.com/yaoleifly/monk-harness) — DeepSeek Harness 发行版，浏览器 Agent 默认走 Monk
+- [homebrew-tap](https://github.com/yaoleifly/homebrew-tap) — `brew install yaoleifly/tap/monk-pi`
+- [帮助中心](https://monk.party/help/) · [接码](https://monk.party/sms/) · [Gemini 激活](https://monk.party/gemini/) · [账号商店](https://monk.party/store/) · [3D 办公室](https://monk.party/office/3d/)
 
 ## 许可
 
