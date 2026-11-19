@@ -175,7 +175,7 @@ struct Config: Codable {
 
 enum Cfg {
     static let endpoint = URL(string: "https://monk.party/monk-api/lookup-order")!
-    static let accountPage = URL(string: "https://monk.party/account/")!
+    static let accountPage = URL(string: "https://monk.party/me/")!
     static let helpPage = URL(string: "https://monk.party/help/")!
     static let charterPage = URL(string: "https://monk.party/charter/")!
     static let homePage = URL(string: "https://monk.party/")!
@@ -1998,8 +1998,10 @@ struct SettingsView: View {
                     // 邮箱验证码登录
                     loginCard
 
-                    // 凭据设置
-                    credentialsCard
+                    // 凭据设置：未登录才显示（登录后邮箱/卡号/本机 Key 都不必再填，多卡用面板里的切换器）
+                    if model.loggedInEmail == nil {
+                        credentialsCard
+                    }
 
                     // 偏好设置
                     preferencesCard
@@ -2589,6 +2591,14 @@ struct SettingsView: View {
                         Button("退出") { model.logout() }
                             .buttonStyle(.bordered).controlSize(.small)
                     }
+                    HStack(spacing: 6) {
+                        Text("本机 Key").font(.caption.weight(.medium)).frame(width: 55, alignment: .leading)
+                        SecureField("选填 · sk-monk-… · Ping 连通测试用", text: $model.apiKey)
+                            .textFieldStyle(.roundedBorder)
+                            .font(.system(.body, design: .monospaced))
+                        Button("粘贴") { model.pasteApiKey() }
+                            .buttonStyle(.bordered).controlSize(.small)
+                    }
                 } else {
                     HStack(spacing: 6) {
                         Text("邮箱").font(.caption.weight(.medium)).frame(width: 55, alignment: .leading)
@@ -2974,7 +2984,7 @@ func selfCheck() {
 
     let link = Cfg.accountURL(email: "you@example.com", tradeNo: "MK123")
     expect(link.host == "monk.party", "acct host")
-    expect(link.path.hasPrefix("/account"), "acct path")
+    expect(link.path.hasPrefix("/me"), "acct path")
     expect(link.query?.contains("trade=MK123") == true, "acct trade")
     expect(link.query?.contains("email=") == true, "acct email")
 
