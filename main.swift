@@ -2591,6 +2591,14 @@ struct SettingsView: View {
                         Button("退出") { model.logout() }
                             .buttonStyle(.bordered).controlSize(.small)
                     }
+                    HStack(spacing: 6) {
+                        Text("本机 Key").font(.caption.weight(.medium)).frame(width: 55, alignment: .leading)
+                        SecureField("选填 · sk-monk-… · Ping 连通测试用", text: $model.apiKey)
+                            .textFieldStyle(.roundedBorder)
+                            .font(.system(.body, design: .monospaced))
+                        Button("粘贴") { model.pasteApiKey() }
+                            .buttonStyle(.bordered).controlSize(.small)
+                    }
                 } else {
                     HStack(spacing: 6) {
                         Text("邮箱").font(.caption.weight(.medium)).frame(width: 55, alignment: .leading)
@@ -2976,7 +2984,7 @@ func selfCheck() {
 
     let link = Cfg.accountURL(email: "you@example.com", tradeNo: "MK123")
     expect(link.host == "monk.party", "acct host")
-    expect(link.path.hasPrefix("/account"), "acct path")
+    expect(link.path.hasPrefix("/me"), "acct path")
     expect(link.query?.contains("trade=MK123") == true, "acct trade")
     expect(link.query?.contains("email=") == true, "acct email")
 
