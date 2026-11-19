@@ -175,7 +175,7 @@ struct Config: Codable {
 
 enum Cfg {
     static let endpoint = URL(string: "https://monk.party/monk-api/lookup-order")!
-    static let accountPage = URL(string: "https://monk.party/account/")!
+    static let accountPage = URL(string: "https://monk.party/me/")!
     static let helpPage = URL(string: "https://monk.party/help/")!
     static let charterPage = URL(string: "https://monk.party/charter/")!
     static let homePage = URL(string: "https://monk.party/")!
@@ -1998,8 +1998,10 @@ struct SettingsView: View {
                     // 邮箱验证码登录
                     loginCard
 
-                    // 凭据设置
-                    credentialsCard
+                    // 凭据设置：未登录才显示（登录后邮箱/卡号/本机 Key 都不必再填，多卡用面板里的切换器）
+                    if model.loggedInEmail == nil {
+                        credentialsCard
+                    }
 
                     // 偏好设置
                     preferencesCard
